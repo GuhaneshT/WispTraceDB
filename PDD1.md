@@ -1,5 +1,22 @@
 # Design Doc 1
-### Status: **FROZEN v1.1** — baseline for architecture and implementation
+### Status: **FROZEN v1.2** — baseline for architecture and implementation
+
+## Amendment v1.2 (additive — see PAD1.md v1.2 for the technical detail this tracks)
+
+- **Tombstone support (delete semantics) moves into v1 in-scope, §5** —
+  not because a user-facing delete-by-trace API is being added as a
+  feature, but because retention-driven segment expiry (§8 of the
+  architecture doc) is unavoidable in any v1 deployment with a retention
+  policy, and it requires a WAL-level tombstone record to keep the trace
+  index consistent with segments being retired. Since the WAL record
+  format is decided in Build order Phase 1 and is expensive to change
+  after the fact, this can't be deferred to v1.5 the way the S3 payload
+  tier was.
+- This does **not** commit to shipping a user-facing "delete this trace"
+  API in v1 — that remains a separate, smaller decision. It commits only
+  to the WAL record format supporting a `deleted` flag and the
+  reconciliation/compaction machinery handling it correctly, which
+  retention needs regardless.
 
 ## Amendment v1.1 (additive — see PAD1.md v1.1 for the technical amendments this tracks)
 
@@ -144,6 +161,10 @@ but differently-scoped project.
 - Startup checkpoint/watermark mechanism bounding reconciliation and
   rollup replay cost (Architecture doc v1.1) — added to in-scope list
   since it's now a v1 requirement, not a v1.5 optimization.
+- Tombstone support in the WAL record format and reconciliation/compaction
+  machinery (Architecture doc v1.2), required by retention-driven segment
+  expiry — see Amendment v1.2 above. A user-facing delete-by-trace API is
+  not itself committed to v1 by this; only the underlying mechanism is.
 
 ### Explicitly out of scope for v1
 
@@ -203,9 +224,12 @@ minutes" for anyone past a small trial dataset.
 ## 8. Freeze notes
 
 v1.0 was the full scope of design discussion through initial freeze. v1.1
-(this version) is a deliberate, versioned amendment recording the naming
-decision and the architecture-side resolutions from PAD1.md v1.1 that this
-doc's risk and scope sections depend on. Any future change to objective,
-target user, USP claims, or v1 scope should be made as a further
-deliberate, versioned amendment — not a silent drift — given how much of
-the architecture doc depends on the scope boundaries fixed here.
+was a deliberate, versioned amendment recording the naming decision and
+the architecture-side resolutions from PAD1.md v1.1 that this doc's risk
+and scope sections depend on. v1.2 (this version) adds tombstone support
+to v1 in-scope (§5), tracking PAD1.md v1.2's discovery that retention-
+driven segment expiry requires WAL-level tombstones regardless of whether
+a user-facing delete API ships. Any future change to objective, target
+user, USP claims, or v1 scope should be made as a further deliberate,
+versioned amendment — not a silent drift — given how much of the
+architecture doc depends on the scope boundaries fixed here.

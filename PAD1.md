@@ -1,7 +1,54 @@
 # Architecture Doc 1
-### Status: **FROZEN v1.1** — baseline for implementation
+### Status: **FROZEN v1.2** — baseline for implementation
 
 Defines the *how*. See `PDD1.md` for the *why*, *who*, and *what*.
+
+---
+
+## Amendment v1.2 (additive — closes a gap found during v1.1 build planning: tombstones were never specified)
+
+**The gap:** retention-driven segment expiry (§8) is unavoidable in any v1
+deployment with a retention policy — it isn't an optional feature the way
+a user-facing delete API is. But §2's span record and §4's reconciliation
+protocol never defined a tombstone, so there was no specified mechanism to
+keep the Pebble trace index consistent with a segment being retired. A
+stale index entry pointing at a deleted segment is a correctness bug, not
+a degraded mode — this had to be closed before Phase 1 build starts, not
+deferred, because the WAL record format decided in Phase 1 is expensive to
+change later (same reasoning as the v1.1 checkpoint amendment).
+
+- **Tombstone is a first-class WAL record type, added to the §2 span
+  schema now: `Deleted bool` alongside the existing fields** — same shape
+  as wisp's own tombstone field. A tombstone is a *write* (Pillar 1's job
+  is exactly "accept a write, make it durable, acknowledge it"), so it
+  goes through the WAL-first path like any span, not a special case bolted
+  onto ingestion later.
+- **A tombstone's effect lands only in Pebble, never in the segment.**
+  Segments stay immutable (§1). Write the tombstone at the *same key*
+  `trace_id∥span_id` in Pebble. A point lookup (§4) that hits a tombstone
+  entry stops there and returns deleted — it never falls through to read
+  the segment offset. Same semantics as wisp's `Get`: a tombstone is
+  authoritative and stops the search.
+- **Tombstone writes go through the existing reconciliation protocol
+  unchanged (§4)** — the checkpoint only advances once both the WAL
+  tombstone record and the Pebble tombstone `Put` are confirmed; crash
+  recovery replays pending tombstones from the checkpoint watermark
+  forward exactly like pending inserts. No new recovery mechanism needed.
+- **Segment/index co-deletion at compaction time (§3) — this is the actual
+  answer to "how do both sources get validated."** When a major compaction
+  (§ Compactor precedent: wisp's `IsMajor`) drops a segment, the Pebble
+  entries for every span that lived in that segment must be deleted in the
+  *same* compaction pass, before the old segment file is unlinked.
+  Compaction already knows which spans it's dropping, so batch the
+  corresponding Pebble deletes into the same manifest-swap transaction
+  described in §3's MVCC visibility model. **Invariant:** a segment is only
+  safe to physically unlink once no Pebble entry still points into it —
+  checkable by construction if the Pebble batch commits before the unlink,
+  not after.
+- **Scope implication for PDD1:** since the WAL record format must support
+  tombstones regardless of whether delete-by-trace ships as a user-facing
+  API in v1, add it to PDD1 §5's in-scope list now rather than treat it as
+  a v1.5 feature bolted onto an ingestion path that didn't anticipate it.
 
 ---
 
@@ -77,6 +124,7 @@ bounded-cardinality aggregate metrics only.
 | `tokens_in`, `tokens_out`, `cost`, `latency_ms` | numeric | rollup + aggregation targets — the USP's typed-column claim |
 | `timestamp` | int64 | primary time axis; also drives per-segment zone maps |
 | `payload` | opaque blob | prompt/response/tool I/O — never scanned by aggregation |
+| `deleted` | bool | tombstone flag (v1.2) — see §4's tombstone/co-deletion subsection |
 
 Which OTel GenAI attributes get promoted to typed columns vs. left in the
 opaque payload is a deliberate modeling decision to make explicitly per
@@ -121,6 +169,12 @@ trace/span IDs is enough); ordering across concurrent writers.
 buffer for batching. On buffer overflow, spill to WAL. If the WAL's own
 disk is full, reject new writes explicitly rather than drop them silently.
 
+**Tombstones are ordinary writes (v1.2).** A delete is a WAL record with
+`deleted=true` (§2), flowing through this same durability path — not a
+separate mechanism layered on afterward. See §4 for how a tombstone
+propagates to the trace index and §3's compaction subsection for how it
+eventually reclaims space.
+
 **Embedded-mode caveat:** as a library inside someone else's process, this
 system does not control that process's lifecycle. Crash-recovery testing
 must explicitly include "host process dies unexpectedly while embedded" as
@@ -161,6 +215,14 @@ evolution doesn't require a hard migration across existing segments.
   and correct — the partial new segment is simply orphaned and cleaned up
   on next startup. If it dies after the swap but before old-segment
   cleanup, cleanup just resumes on restart.
+
+**Segment/index co-deletion (v1.2)** — a major compaction that drops a
+segment must delete that segment's corresponding Pebble trace-index
+entries in the *same* manifest-swap transaction, before the old segment
+file is unlinked. A segment is only safe to physically unlink once no
+Pebble entry still points into it (§4). Retention-driven expiry uses this
+same path — expiry is just compaction dropping a segment nothing else
+references, so it needs no separate mechanism.
 
 **Ingestion buffering uses a session-window heuristic** — flush a trace's
 spans together once no new span for that trace has arrived for N seconds —
@@ -233,6 +295,17 @@ the system — design this on paper before writing flush code):
   but no confirmed index entry (or vice versa) in that tail range is
   expected, recoverable, unconfirmed state — re-derive and rewrite it from
   the WAL, never treat it as corruption.
+
+**Tombstones and index/segment co-deletion (v1.2)** — a tombstone (§2, §3
+Pillar 1) is written to Pebble at the same key it would otherwise occupy,
+`trace_id∥span_id`. A point lookup hitting a tombstone entry stops
+immediately and returns deleted, the same way a hit on a live entry
+returns a location — it never reads the segment. Tombstone writes go
+through the same reconciliation protocol as inserts (below): the
+checkpoint only advances once both the WAL record and the Pebble `Put` are
+confirmed. Actual space reclamation — removing the tombstone entry itself
+and the segment data it shadows — happens at compaction time (§3), not at
+delete time; until then the tombstone is the authoritative answer.
 
 **Where the LSM is used — and, just as importantly, where it is not:**
 exactly two touchpoints in the whole system.
@@ -409,17 +482,27 @@ typical product roadmap — durability before features:
 1. **WAL + crash recovery**, tested with a `kill -9`-in-a-loop fault
    injection harness, until it's trusted completely. Pick a placeholder
    WAL-rotation/segment-flush size to test against now (v1.1 amendment) —
-   not blocking, but must exist before step 1 is called done.
+   not blocking, but must exist before step 1 is called done. **Include
+   the `deleted` tombstone field in the WAL record format from the start
+   (v1.2)** — this is the expensive-to-retrofit decision, not the
+   compaction-side handling below.
 2. **Segment write path + the segment/trace-index reconciliation
    protocol** (§4), designed on paper first, including the checkpoint/
    watermark mechanism (v1.1 amendment) from the start — retrofitting a
    checkpoint after the reconciliation protocol is built and tested is
-   far more expensive than including it in the original design.
+   far more expensive than including it in the original design. Tombstone
+   writes (v1.2) reuse this same protocol — no separate design needed here.
    - **2a. WAL/index version tagging + downgrade path** (§9) — slot this in
      here, not left implicit, since this is when the on-disk formats
      first exist and are cheapest to version correctly.
 3. **Compaction with MVCC-style segment visibility** (§3), also
-   fault-injection tested.
+   fault-injection tested. **Segment/index co-deletion (v1.2)** belongs
+   here — batching Pebble entry deletion into the same manifest-swap
+   transaction that drops a segment. Fault-inject this specifically:
+   crash between the Pebble delete batch and the segment unlink, and
+   verify no dangling index entry survives (it shouldn't, if the batch
+   commits before the unlink) and no segment is unlinked while entries
+   still point into it.
 4. **Bloom filters + zone maps** (§5) — low risk, embedded in segment
    writes from step 2 rather than bolted on later.
 5. **Rollups + aggregation fallback** (§6) — the USP-critical path;
@@ -465,12 +548,18 @@ whether the project's USP is two claims or one.
 
 ## 14. Freeze notes
 
-v1.0 was the technical baseline. v1.1 (this version) is a deliberate,
-versioned amendment resolving four items flagged at the v1.0 freeze
-review: LSM library choice, startup-checkpoint requirement, rollup replay
-bound, and the missing version-tagging build-order slot — per the v1.0
-freeze note's own instruction that changes be deliberate amendments, not
-silent drift. Any future change to the pillar structure, the
-trace-index/tag-index design, the payload-storage decision, the LSM
-boundary, or the checkpoint mechanism introduced here should itself be a
-further deliberate, versioned amendment against this freeze.
+v1.0 was the technical baseline. v1.1 was a deliberate, versioned
+amendment resolving four items flagged at the v1.0 freeze review: LSM
+library choice, startup-checkpoint requirement, rollup replay bound, and
+the missing version-tagging build-order slot. v1.2 (this version) closes a
+gap found during v1.1 build planning: tombstones were never specified,
+despite retention-driven segment expiry making them unavoidable in any v1
+deployment. v1.2 adds the `deleted` field to the §2 span schema, routes
+tombstone writes through the existing §4 reconciliation protocol
+unchanged, and specifies segment/index co-deletion as part of §3's
+compaction. Per the v1.0 freeze note's own instruction that changes be
+deliberate amendments, not silent drift: any future change to the pillar
+structure, the trace-index/tag-index design, the payload-storage decision,
+the LSM boundary, the checkpoint mechanism, or the tombstone/co-deletion
+protocol introduced here should itself be a further deliberate, versioned
+amendment against this freeze.
