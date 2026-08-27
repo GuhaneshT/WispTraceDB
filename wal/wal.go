@@ -16,18 +16,25 @@ import (
 	"sync"
 )
 
+// WALMetadata carries the on-disk format version a record was written with.
+// It is not a per-record trailer of derived values (length/checksum are
+// framing concerns, handled by putRecordHeader) — its only job is letting
+// replay detect a record written by an incompatible future/past layout
+// before misinterpreting its bytes.
 type WALMetadata struct {
-	Magic       uint32 
-	Version     uint16 
-	RecordType  uint8  
-	RecordLen   uint32 
-	Checksum    uint32 
+	Version uint8
 }
- 
+
+// CurrentWALVersion is written into every record's header by AppendRecord.
+// Bump this whenever encodePayload/deserializePayload's wire layout changes,
+// and add explicit handling in deserializePayload for any old version this
+// build must still be able to replay.
+const CurrentWALVersion uint8 = 1
+
 type SpanPayload struct {
 	TraceID      string  // Distributed trace ID
 	SpanID       string  // Unique span identifier
-	ParentSpanID string  // Parent span identifier (empty if root)
+	ParentSpanID string  // Parent span identifier; "" means root span — same convention OTel uses, not a separate null encoding on the wire
 	Timestamp    int64 // When the span was created
 	AgentID      string  // Agent that processed this span
 	Model        string  // Model name/identifier
@@ -50,7 +57,8 @@ type WALRecord struct {
 
 const (
 	DefaultMaxSegmentSize uint64 = 4 * 1024 * 1024
-	recordHeaderSize             = 8
+	// recordHeaderSize = version(1) + crc32(4) + payload length(4).
+	recordHeaderSize             = 9
 	maxRecordSize         uint64 = 64 << 20
 	fixedPayloadHeaderSize = 8 + 4 + 4 + 8 + 8 + 1
 	strLenSize  = 2 // uint16 prefix for each string field
@@ -177,11 +185,15 @@ func deserializePayload(data []byte) (WALRecord, error) {
 	return WALRecord{Span: span}, nil 
 }
 
-// putRecordHeader writes the on-disk record framing (crc32 of the payload
-// followed by the payload length) into the first recordHeaderSize bytes of buf.
-func putRecordHeader(buf []byte, payload []byte) {
-	binary.LittleEndian.PutUint32(buf[0:4], crc32.ChecksumIEEE(payload))
-	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(payload)))
+// putRecordHeader writes the on-disk record framing — format version, crc32
+// of the payload, then the payload length — into the first recordHeaderSize
+// bytes of buf. The version is checked on replay before the payload is
+// interpreted, so a future layout change is detected explicitly rather than
+// silently misparsed.
+func putRecordHeader(buf []byte, version uint8, payload []byte) {
+	buf[0] = version
+	binary.LittleEndian.PutUint32(buf[1:5], crc32.ChecksumIEEE(payload))
+	binary.LittleEndian.PutUint32(buf[5:9], uint32(len(payload)))
 }
 
 // WAL is a segmented write-ahead log. Records are appended to the active
@@ -312,9 +324,14 @@ func (w *WAL) AppendRecord(record WALRecord) error {
 	if cap(buf) < recordSize {
 		buf = make([]byte, recordSize)
 	}
+	version := record.Metadata.Version
+	if version == 0 {
+		version = CurrentWALVersion
+	}
+
 	buf = buf[:recordSize]
 	encodePayload(buf[recordHeaderSize:], record)
-	putRecordHeader(buf, buf[recordHeaderSize:])
+	putRecordHeader(buf, version, buf[recordHeaderSize:])
 	*bufPtr = buf
 
 	w.mu.Lock()
@@ -456,10 +473,18 @@ func replaySegment(path string, tolerateTornTail bool) ([]WALRecord, error) {
 			}
 			return nil, err
 		}
-		checksum := binary.LittleEndian.Uint32(header[0:4])
-		size := binary.LittleEndian.Uint32(header[4:8])
+		version := header[0]
+		checksum := binary.LittleEndian.Uint32(header[1:5])
+		size := binary.LittleEndian.Uint32(header[5:9])
 		if uint64(size) > maxRecordSize {
 			return nil, fmt.Errorf("WAL record size %d exceeds maximum %d", size, maxRecordSize)
+		}
+		// Reject anything but the version this build knows how to decode. A
+		// torn tail truncates bytes; it never produces a well-framed record
+		// with a foreign version, so this is always a real incompatibility,
+		// not a partial write.
+		if version != CurrentWALVersion {
+			return nil, fmt.Errorf("WAL record version %d unsupported (this build reads version %d)", version, CurrentWALVersion)
 		}
 
 		payload := make([]byte, size)
@@ -478,6 +503,7 @@ func replaySegment(path string, tolerateTornTail bool) ([]WALRecord, error) {
 		if err != nil {
 			return nil, err
 		}
+		record.Metadata.Version = version
 		records = append(records, record)
 	}
 	return records, nil

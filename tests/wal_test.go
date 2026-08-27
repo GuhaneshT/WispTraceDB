@@ -312,11 +312,11 @@ func TestWALReplayRejectsChecksumMismatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wal.log")
 
-	// ADAPTED: recordHeaderSize is unexported; the framing width (crc32 +
-	// length, 8 bytes) is documented package behavior, mirrored here as a
-	// local constant purely to locate a byte inside the first record's
+	// ADAPTED: recordHeaderSize is unexported; the framing width (version +
+	// crc32 + length, 9 bytes) is documented package behavior, mirrored here
+	// as a local constant purely to locate a byte inside the first record's
 	// payload region to corrupt.
-	const recordHeaderSize = 8
+	const recordHeaderSize = 9
 
 	w, err := wal.CreateWAL(path)
 	if err != nil {
@@ -351,6 +351,49 @@ func TestWALReplayRejectsChecksumMismatch(t *testing.T) {
 
 	if _, err := reopened.Replay(); err == nil {
 		t.Fatal("Replay() error = nil, want a checksum mismatch error")
+	}
+}
+
+// TestWALTombstoneRoundTripsAsAuthoritativeDelete verifies a tombstone
+// (Deleted=true) is an ordinary WAL record — it survives rotation and
+// replay with Deleted intact, alongside live records for the same trace.
+// PAD1 v1.2 requires tombstones to flow through the same durability path as
+// inserts; if Deleted silently dropped during encode/decode, a delete would
+// look like a live span after any crash-recovery replay.
+func TestWALTombstoneRoundTripsAsAuthoritativeDelete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+
+	w, err := wal.CreateWAL(path)
+	if err != nil {
+		t.Fatalf("CreateWAL() error = %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	live := wal.WALRecord{Span: wal.SpanPayload{TraceID: "t1", SpanID: "s1", Status: "ok"}}
+	tombstone := wal.WALRecord{Span: wal.SpanPayload{TraceID: "t1", SpanID: "s2", Deleted: true}}
+
+	if err := w.AppendRecord(live); err != nil {
+		t.Fatalf("AppendRecord(live) error = %v", err)
+	}
+	if err := w.AppendRecord(tombstone); err != nil {
+		t.Fatalf("AppendRecord(tombstone) error = %v", err)
+	}
+
+	got, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Replay() len = %d, want 2", len(got))
+	}
+	if got[0].Span.Deleted {
+		t.Fatalf("Replay()[0].Span.Deleted = true, want false (live record)")
+	}
+	if !got[1].Span.Deleted {
+		t.Fatalf("Replay()[1].Span.Deleted = false, want true (tombstone record)")
+	}
+	if !recordsEqual(got[1], tombstone) {
+		t.Fatalf("Replay()[1] = %+v, want %+v", got[1], tombstone)
 	}
 }
 
