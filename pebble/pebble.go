@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-
+	"sync"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -32,7 +32,19 @@ func OpenDB(path string) (*DB, error) {
 	return &DB{db: lsmdb, path: path}, nil
 }
 
-// Close flushes pending writes and closes the database.
+
+// spanLocationBufPool holds reusable 16-byte location buffers for PutSpan.
+// Encoding happens without holding the Pebble lock, so concurrent callers
+// each get their own buffer from the pool, avoiding allocation churn on the
+// hot path. The pool is only used for the encode-then-write flow; reads
+// decode directly without pooling (decoding is cheap, allocation is the issue).
+var spanLocationBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 16)
+		return &buf
+	},
+}
+
 func (d *DB) Close() error {
 	if d.db == nil {
 		return nil
@@ -40,10 +52,14 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
+// PutSpan writes a span location into the trace index. key is trace_id||span_id
 
 func (d *DB) PutSpan(key []byte, location SpanLocation) error {
-	value := encodeSpanLocation(location)
-	return d.db.Set(key, value, &pebble.WriteOptions{Sync: true})
+	bufPtr := spanLocationBufPool.Get().(*[]byte)
+	defer spanLocationBufPool.Put(bufPtr)
+	buf := *bufPtr
+	encodeSpanLocationInto(buf, location)
+	return d.db.Set(key, buf, &pebble.WriteOptions{Sync: true})
 }
 
 // Delete also returns a not found here
@@ -64,7 +80,8 @@ func (d *DB) GetSpan(key []byte) (SpanLocation, error) {
 	return location, nil
 }
 
-// Scan to reconstruct a full trace
+// PrefixScan returns all span locations with the given prefix (e.g., trace_id||).
+// Used to reconstruct a full trace.
 func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 	iter := d.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -72,7 +89,7 @@ func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 	})
 	defer iter.Close()
 
-	var locations []SpanLocation
+	locations := make([]SpanLocation, 0, 16)
 	for iter.First(); iter.Valid(); iter.Next() {
 		location, err := decodeSpanLocation(iter.Value())
 		if err != nil {
@@ -89,13 +106,16 @@ func (d *DB) DeleteSpan(key []byte) error {
 }
 
 
-func encodeSpanLocation(loc SpanLocation) []byte {
-	buf := make([]byte, 16)
+func encodeSpanLocationInto(buf []byte, loc SpanLocation) {
 	binary.LittleEndian.PutUint64(buf[0:8], loc.SegmentID)
 	binary.LittleEndian.PutUint64(buf[8:16], loc.Offset)
-	return buf
 }
 
+func encodeSpanLocation(loc SpanLocation) []byte {
+	buf := make([]byte, 16)
+	encodeSpanLocationInto(buf, loc)
+	return buf
+}
 
 func decodeSpanLocation(data []byte) (SpanLocation, error) {
 	if len(data) != 16 {
