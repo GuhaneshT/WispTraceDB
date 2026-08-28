@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
 	"github.com/cockroachdb/pebble"
 )
 
@@ -53,8 +54,12 @@ func (d *DB) Close() error {
 }
 
 // PutSpan writes a span location into the trace index. key is trace_id||span_id
-
+// (concatenated strings), location is the segment_id and byte offset where the
+// span's data lives. Write is fsync'd before returning for crash-safe durability.
 func (d *DB) PutSpan(key []byte, location SpanLocation) error {
+	if d.db == nil {
+		return fmt.Errorf("pebble db is closed")
+	}
 	bufPtr := spanLocationBufPool.Get().(*[]byte)
 	defer spanLocationBufPool.Put(bufPtr)
 	buf := *bufPtr
@@ -62,8 +67,12 @@ func (d *DB) PutSpan(key []byte, location SpanLocation) error {
 	return d.db.Set(key, buf, &pebble.WriteOptions{Sync: true})
 }
 
-// Delete also returns a not found here
+// GetSpan retrieves a span location by its composite key (trace_id||span_id).
+// Returns ErrNotFound if the key is not in the index.
 func (d *DB) GetSpan(key []byte) (SpanLocation, error) {
+	if d.db == nil {
+		return SpanLocation{}, fmt.Errorf("pebble db is closed")
+	}
 	value, closer, err := d.db.Get(key)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
@@ -81,8 +90,11 @@ func (d *DB) GetSpan(key []byte) (SpanLocation, error) {
 }
 
 // PrefixScan returns all span locations with the given prefix (e.g., trace_id||).
-// Used to reconstruct a full trace.
+// Used to reconstruct a full trace. Pre-allocates result slice expecting ~16 spans.
 func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
+	if d.db == nil {
+		return nil, fmt.Errorf("pebble db is closed")
+	}
 	iter := d.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixUpperBound(prefix),
@@ -101,10 +113,69 @@ func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 }
 
 
+// DeleteSpan removes a span from the trace index (tombstone effect).
+// Used during retention-driven expiry when a segment is dropped.
 func (d *DB) DeleteSpan(key []byte) error {
+	if d.db == nil {
+		return fmt.Errorf("pebble db is closed")
+	}
 	return d.db.Delete(key, &pebble.WriteOptions{Sync: true})
 }
 
+// BatchPutSpans writes multiple span locations atomically. Used during segment
+// flush to index all spans of a segment in one transaction (PAD1 §4 reconciliation).
+// If the process crashes before Sync, none of the writes are visible; if it
+// crashes during Sync, the entire batch either commits or rolls back.
+func (d *DB) BatchPutSpans(entries map[string]SpanLocation) error {
+	if d.db == nil {
+		return fmt.Errorf("pebble db is closed")
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	batch := d.db.NewBatch()
+	defer batch.Close()
+
+	// Encode all entries into the batch (reuse pooled buffers).
+	for keyStr, location := range entries {
+		key := []byte(keyStr)
+		bufPtr := spanLocationBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		encodeSpanLocationInto(buf, location)
+		if err := batch.Set(key, buf, nil); err != nil {
+			spanLocationBufPool.Put(bufPtr)
+			return fmt.Errorf("batch.Set: %w", err)
+		}
+		spanLocationBufPool.Put(bufPtr)
+	}
+
+	// Fsync the entire batch at once.
+	return batch.Commit(&pebble.WriteOptions{Sync: true})
+}
+
+// BatchDeleteSpans removes multiple spans atomically (used at compaction time when
+// a segment is dropped and its entries must be removed from the index together).
+func (d *DB) BatchDeleteSpans(keys []string) error {
+	if d.db == nil {
+		return fmt.Errorf("pebble db is closed")
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	batch := d.db.NewBatch()
+	defer batch.Close()
+
+	for _, keyStr := range keys {
+		key := []byte(keyStr)
+		if err := batch.Delete(key, nil); err != nil {
+			return fmt.Errorf("batch.Delete: %w", err)
+		}
+	}
+
+	return batch.Commit(&pebble.WriteOptions{Sync: true})
+}
 
 func encodeSpanLocationInto(buf []byte, loc SpanLocation) {
 	binary.LittleEndian.PutUint64(buf[0:8], loc.SegmentID)

@@ -177,3 +177,72 @@ func TestMultipleTracesInIndex(t *testing.T) {
 		t.Fatalf("PrefixScan(trace-001) len = %d, want 1", len(trace1Spans))
 	}
 }
+
+func TestBatchPutSpans(t *testing.T) {
+	db, err := OpenDB(filepath.Join(t.TempDir(), "test_lsm"))
+	if err != nil {
+		t.Fatalf("OpenDB() error = %v", err)
+	}
+	defer db.Close()
+
+	// Batch write multiple spans of the same segment (as would happen during segment flush).
+	entries := map[string]SpanLocation{
+		"trace-001||span-001": {SegmentID: 1, Offset: 0},
+		"trace-001||span-002": {SegmentID: 1, Offset: 256},
+		"trace-002||span-001": {SegmentID: 1, Offset: 512},
+	}
+
+	if err := db.BatchPutSpans(entries); err != nil {
+		t.Fatalf("BatchPutSpans() error = %v", err)
+	}
+
+	// Verify all entries were written.
+	for keyStr, expectedLoc := range entries {
+		got, err := db.GetSpan([]byte(keyStr))
+		if err != nil {
+			t.Fatalf("GetSpan(%s) error = %v", keyStr, err)
+		}
+		if got.SegmentID != expectedLoc.SegmentID || got.Offset != expectedLoc.Offset {
+			t.Fatalf("GetSpan(%s) = %+v, want %+v", keyStr, got, expectedLoc)
+		}
+	}
+}
+
+func TestBatchDeleteSpans(t *testing.T) {
+	db, err := OpenDB(filepath.Join(t.TempDir(), "test_lsm"))
+	if err != nil {
+		t.Fatalf("OpenDB() error = %v", err)
+	}
+	defer db.Close()
+
+	// Write some spans.
+	keys := []string{"trace-001||span-001", "trace-001||span-002", "trace-002||span-001"}
+	for i, key := range keys {
+		loc := SpanLocation{SegmentID: 1, Offset: uint64(i * 256)}
+		if err := db.PutSpan([]byte(key), loc); err != nil {
+			t.Fatalf("PutSpan() error = %v", err)
+		}
+	}
+
+	// Batch delete the first two.
+	if err := db.BatchDeleteSpans(keys[:2]); err != nil {
+		t.Fatalf("BatchDeleteSpans() error = %v", err)
+	}
+
+	// Verify the first two are gone.
+	for _, key := range keys[:2] {
+		_, err := db.GetSpan([]byte(key))
+		if err == nil {
+			t.Fatalf("GetSpan(%s) should error after delete", key)
+		}
+	}
+
+	// Verify the third still exists.
+	got, err := db.GetSpan([]byte(keys[2]))
+	if err != nil {
+		t.Fatalf("GetSpan(%s) error = %v", keys[2], err)
+	}
+	if got.Offset != 512 {
+		t.Fatalf("GetSpan(%s) offset = %d, want 512", keys[2], got.Offset)
+	}
+}
