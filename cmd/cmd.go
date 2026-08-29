@@ -18,9 +18,6 @@ const (
 	defaultCheckpointPath   = "checkpoint.dat"
 
 	// defaultSegmentFlushThreshold is a placeholder pending benchmarking,
-	// same posture PAD1 §12 step 1 requires for the WAL's own rotation size:
-	// a tuned-for-testing value now, revisited once real ingestion patterns
-	// exist. Not a claim that 1000 spans/segment is the right production number.
 	defaultSegmentFlushThreshold = 1000
 )
 
@@ -113,29 +110,59 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 		index:         indexInstance,
 		checkpoint:    checkpoint,
 		segmentWriter: segment.NewWriter(),
-		// Segment ids are never reused — the next one to write is always
-		// one past the last confirmed. On a fresh database (checkpoint = 0)
-		// this starts at 1, matching the WAL's own generation-1 convention.
 		nextSegmentID: lastConfirmedSegment + 1,
 	}
 
-	// NOTE: full crash-recovery replay (rebuilding any WAL records after the
-	// checkpoint watermark that never made it into a confirmed segment) is
-	// not yet implemented here — see PAD1 §4's reconciliation protocol.
-	// Until it lands, a crash between AppendRecord and a successful
-	// flushSegmentLocked loses those buffered-but-unflushed spans from the
-	// derived (segment+index) state, even though the WAL itself still has
-	// them. This is a known, tracked gap, not a silent one.
+	if err := wt.recover(); err != nil {
+		_ = walInstance.Close()
+		_ = indexInstance.Close()
+		return nil, fmt.Errorf("recover: %w", err)
+	}
 
 	return wt, nil
 }
 
-// InsertSpan is the entry point for Pillar 1 (PAD1 §3): append the span to
-// the WAL (durable immediately, fsynced), then buffer it for the current
-// segment. Once the buffer crosses SegmentFlushThreshold, the segment is
-// flushed and indexed before InsertSpan returns — so a caller that gets a
-// nil error back knows the flush (if one was triggered) has already gone
-// through the full reconciliation protocol, not just the WAL append.
+// recover rebuilds any buffered-but-unflushed state from the WAL after a
+// restart. Because RemoveSegmentsUpTo already pruned every WAL segment
+// covered by a confirmed flush (checkpoint.Save happens before that prune,
+// per flushSegmentLocked's ordering), wal.Replay() here only ever returns
+// the unconfirmed tail: spans that were durably appended to the WAL (step ①
+// of InsertSpan) but never completed a full flushSegmentLocked pass before
+// the process stopped.
+//
+// Without this, those spans would be silently invisible to segment/index
+// state even though the WAL still has them — exactly the gap PAD1 §3's
+// standing test rules out ("if every segment, index file, and rollup were
+// deleted right now, could correct state be fully reconstructed from the
+// WAL alone?").
+//
+// Recovered spans are flushed immediately (not merely re-buffered) so that
+// CreateWispTraceWithConfig never returns with an unconfirmed tail already
+// sitting in memory — the invariant after a successful call is always
+// "checkpoint == latest segment," the same as a fresh database with no
+// prior crash. Must be called before any InsertSpan is accepted.
+func (w *WispTrace) recover() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	records, err := w.wal.Replay()
+	if err != nil {
+		return fmt.Errorf("replay wal: %w", err)
+	}
+	if len(records) == 0 {
+		return nil
+	}
+
+	for _, record := range records {
+		w.segmentWriter.Add(record.Span)
+	}
+
+	if err := w.flushSegmentLocked(); err != nil {
+		return fmt.Errorf("flush recovered spans: %w", err)
+	}
+	return nil
+}
+
 func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -155,34 +182,14 @@ func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
 	return nil
 }
 
-// Flush forces the currently buffered spans to be written and indexed as a
-// segment, even if SegmentFlushThreshold hasn't been reached. Useful for
-// tests and graceful shutdown; a no-op if nothing is buffered.
+
 func (w *WispTrace) Flush() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.flushSegmentLocked()
 }
 
-// flushSegmentLocked runs PAD1 §4's reconciliation protocol end to end:
-//
-//  1. Seal the WAL segment(s) carrying the spans about to be flushed. This
-//     is the same pattern WispDB's freezeMutableLocked uses before flushing
-//     a memtable (wal.Rotate() to seal, then reclaim once the flush lands) —
-//     applied here to a segment flush instead of an SSTable flush.
-//  2. Write the segment file (fsynced on return by Writer.Flush).
-//  3. Index every span it contains into Pebble in one atomic batch.
-//  4. Only once both 2 and 3 are confirmed, advance the checkpoint —
-//     this is the line that makes "durable AND queryable" true, per §4.
-//  5. Only once the checkpoint has advanced, reclaim the sealed WAL
-//     segments — they are now redundant with the segment file + index.
-//
-// If step 2 or 3 fails, the WAL segment sealed in step 1 is NOT reclaimed,
-// so those records remain replayable — the buffered-but-unflushed spans are
-// not lost, just not yet visible outside a WAL replay (see the recovery gap
-// noted in CreateWispTraceWithConfig).
-//
-// Must be called with w.mu held (InsertSpan and Flush both do this).
+
 func (w *WispTrace) flushSegmentLocked() error {
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
@@ -222,10 +229,7 @@ func (w *WispTrace) flushSegmentLocked() error {
 	return nil
 }
 
-// Close flushes any buffered spans, then closes the WAL and Pebble index.
-// Errors from all three steps are collected rather than short-circuited, so
-// a caller sees every resource that failed to close cleanly, not just the
-// first one.
+
 func (w *WispTrace) Close() error {
 	var errs []error
 

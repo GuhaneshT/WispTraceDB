@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -162,6 +163,130 @@ func TestCloseFlushesRemainingBufferedSpans(t *testing.T) {
 	key := segment.CompositeKey("t1", "s1")
 	if _, err := idx.GetSpan([]byte(key)); err != nil {
 		t.Fatalf("GetSpan() after Close()'s final flush error = %v", err)
+	}
+}
+
+// crashClose closes the WAL and Pebble index directly, bypassing wt.Close()
+// (which would flush any buffered spans and hide exactly the gap these tests
+// exist to catch). This is what a real crash looks like from recover()'s
+// perspective: the WAL is durable up to its last fsynced append, but nothing
+// buffered only in segmentWriter's memory survives.
+func crashClose(t *testing.T, wt *WispTrace) {
+	t.Helper()
+	if err := wt.wal.Close(); err != nil {
+		t.Fatalf("wal.Close() error = %v", err)
+	}
+	if err := wt.index.Close(); err != nil {
+		t.Fatalf("index.Close() error = %v", err)
+	}
+}
+
+func TestRecoverReplaysUnflushedSpansAfterRestart(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 100 // high enough that inserts below won't auto-flush
+
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+
+	spans := []wal.SpanPayload{
+		testSpan("t1", "s1", 100),
+		testSpan("t1", "s2", 110),
+	}
+	for _, s := range spans {
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan() error = %v", err)
+		}
+	}
+
+	// Sanity check: nothing has been flushed or indexed yet — these spans
+	// only exist in the WAL and in segmentWriter's in-memory buffer.
+	if wt.nextSegmentID != 1 {
+		t.Fatalf("nextSegmentID = %d, want 1 (nothing flushed before crash)", wt.nextSegmentID)
+	}
+
+	crashClose(t, wt)
+
+	// "Restart": open a fresh WispTrace against the same on-disk paths.
+	wt2, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() after crash error = %v", err)
+	}
+	defer wt2.Close()
+
+	if wt2.nextSegmentID != 2 {
+		t.Fatalf("nextSegmentID = %d, want 2 (recovery should have flushed one segment)", wt2.nextSegmentID)
+	}
+
+	for _, s := range spans {
+		key := segment.CompositeKey(s.TraceID, s.SpanID)
+		loc, err := wt2.index.GetSpan([]byte(key))
+		if err != nil {
+			t.Fatalf("GetSpan(%s) after recovery error = %v", key, err)
+		}
+		if loc.SegmentID != 1 {
+			t.Fatalf("GetSpan(%s).SegmentID = %d, want 1", key, loc.SegmentID)
+		}
+
+		// The span must actually be readable from the recovered segment file,
+		// not just present as a dangling index entry.
+		reader, err := segment.OpenReader(segment.SegmentPath(cfg.SegmentDir, loc.SegmentID))
+		if err != nil {
+			t.Fatalf("OpenReader() error = %v", err)
+		}
+		got, err := reader.ReadAt(loc.Offset)
+		reader.Close()
+		if err != nil {
+			t.Fatalf("ReadAt() error = %v", err)
+		}
+		if got.TraceID != s.TraceID || got.SpanID != s.SpanID {
+			t.Fatalf("recovered span = %+v, want %+v", got, s)
+		}
+	}
+
+	checkpointVal, err := NewCheckpoint(cfg.CheckpointPath).Load()
+	if err != nil {
+		t.Fatalf("checkpoint Load() error = %v", err)
+	}
+	if checkpointVal != 1 {
+		t.Fatalf("checkpoint = %d, want 1", checkpointVal)
+	}
+}
+
+func TestRecoverIsNoopWithNoUnflushedRecords(t *testing.T) {
+	cfg := testConfig(t)
+
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	if err := wt.InsertSpan(testSpan("t1", "s1", 100)); err != nil {
+		t.Fatalf("InsertSpan() error = %v", err)
+	}
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	if wt.nextSegmentID != 2 {
+		t.Fatalf("nextSegmentID = %d, want 2 after explicit flush", wt.nextSegmentID)
+	}
+
+	crashClose(t, wt)
+
+	wt2, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() after restart error = %v", err)
+	}
+	defer wt2.Close()
+
+	// Everything was already confirmed before the "crash" — RemoveSegmentsUpTo
+	// should have pruned the WAL, so replay finds nothing and recover() must
+	// not manufacture an extra, empty segment.
+	if wt2.nextSegmentID != 2 {
+		t.Fatalf("nextSegmentID = %d, want 2 (recovery should be a no-op)", wt2.nextSegmentID)
+	}
+	if _, err := os.Stat(segment.SegmentPath(cfg.SegmentDir, 2)); !os.IsNotExist(err) {
+		t.Fatalf("segment 2 should not exist, stat err = %v", err)
 	}
 }
 
