@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 
 	"github.com/GuhaneshT/WispTraceDB/compactor"
@@ -21,16 +22,24 @@ const (
 
 	// defaultSegmentFlushThreshold is a placeholder pending benchmarking,
 	defaultSegmentFlushThreshold = 1000
+
+	// defaultCompactionSegmentThreshold triggers a compaction pass once the
+	// live segment count exceeds this. A placeholder policy — merge the
+	// oldest half whenever this is crossed — pending real ingestion
+	// patterns, same posture as SegmentFlushThreshold (PAD1 §12 step 1's
+	// "pick a placeholder now, revisit once real usage exists").
+	defaultCompactionSegmentThreshold = 10
 )
 
 type WispTraceConfig struct {
-	WALPath               string
-	WALMaxSegmentSize     uint64
-	PebblePath            string
-	SegmentDir            string
-	CheckpointPath        string
-	ManifestPath          string
-	SegmentFlushThreshold int
+	WALPath                     string
+	WALMaxSegmentSize           uint64
+	PebblePath                  string
+	SegmentDir                  string
+	CheckpointPath              string
+	ManifestPath                string
+	SegmentFlushThreshold       int
+	CompactionSegmentThreshold  int
 }
 
 type WispTrace struct {
@@ -54,13 +63,14 @@ func CreateWisp() (*WispTrace, error) {
 
 func DefaultWispTraceConfig() WispTraceConfig {
 	return WispTraceConfig{
-		WALPath:               defaultWALPath,
-		WALMaxSegmentSize:     defaultWALMaxSegmentSize,
-		PebblePath:            defaultPebblePath,
-		SegmentDir:            defaultSegmentDir,
-		CheckpointPath:        defaultCheckpointPath,
-		ManifestPath:          defaultManifestPath,
-		SegmentFlushThreshold: defaultSegmentFlushThreshold,
+		WALPath:                    defaultWALPath,
+		WALMaxSegmentSize:          defaultWALMaxSegmentSize,
+		PebblePath:                 defaultPebblePath,
+		SegmentDir:                 defaultSegmentDir,
+		CheckpointPath:             defaultCheckpointPath,
+		ManifestPath:               defaultManifestPath,
+		SegmentFlushThreshold:      defaultSegmentFlushThreshold,
+		CompactionSegmentThreshold: defaultCompactionSegmentThreshold,
 	}
 }
 
@@ -85,6 +95,9 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 	}
 	if config.SegmentFlushThreshold == 0 {
 		config.SegmentFlushThreshold = defaultSegmentFlushThreshold
+	}
+	if config.CompactionSegmentThreshold == 0 {
+		config.CompactionSegmentThreshold = defaultCompactionSegmentThreshold
 	}
 
 	if err := os.MkdirAll(config.SegmentDir, 0755); err != nil {
@@ -222,9 +235,48 @@ func (w *WispTrace) flushSegmentLocked() error {
 
 	w.nextSegmentID++
 	w.segmentWriter = segment.NewWriter()
+
+	if err := w.maybeCompactLocked(); err != nil {
+		return fmt.Errorf("post-flush compaction: %w", err)
+	}
+
 	return nil
 }
 
+// maybeCompactLocked runs a placeholder compaction policy: once the live
+// segment count exceeds CompactionSegmentThreshold, merge the oldest half of
+// the live set into one new segment. This is deliberately simple — pick a
+// number, merge that many of the oldest segments — pending real ingestion
+// patterns to benchmark against (same posture as SegmentFlushThreshold).
+// The mechanism it calls (compactor.Compact) is correct regardless of which
+// segments are chosen; only the choice of "oldest half, once over N" is a
+// placeholder here.
+//
+// Must be called with w.flushMu held (flushSegmentLocked already holds it).
+func (w *WispTrace) maybeCompactLocked() error {
+	live, err := w.manifest.Load()
+	if err != nil {
+		return fmt.Errorf("load manifest for compaction check: %w", err)
+	}
+	if len(live) <= w.config.CompactionSegmentThreshold {
+		return nil
+	}
+
+	sort.Slice(live, func(i, j int) bool { return live[i] < live[j] })
+	mergeCount := len(live) / 2
+	if mergeCount < 2 {
+		return nil // nothing meaningful to merge
+	}
+	toMerge := live[:mergeCount]
+
+	newSegmentID := w.nextSegmentID
+	w.nextSegmentID++
+
+	if _, err := compactor.New(w.config.SegmentDir, w.manifest, w.index).Compact(toMerge, newSegmentID); err != nil {
+		return fmt.Errorf("compact segments %v into %d: %w", toMerge, newSegmentID, err)
+	}
+	return nil
+}
 
 func (w *WispTrace) Compactor() *compactor.Compactor {
 	return compactor.New(w.config.SegmentDir, w.manifest, w.index)

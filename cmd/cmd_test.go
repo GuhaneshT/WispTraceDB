@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +18,7 @@ func testConfig(t *testing.T) WispTraceConfig {
 	cfg.PebblePath = filepath.Join(dir, "lsm")
 	cfg.SegmentDir = filepath.Join(dir, "segments")
 	cfg.CheckpointPath = filepath.Join(dir, "checkpoint.dat")
+	cfg.ManifestPath = filepath.Join(dir, "manifest.dat")
 	cfg.SegmentFlushThreshold = 3
 	return cfg
 }
@@ -287,6 +289,62 @@ func TestRecoverIsNoopWithNoUnflushedRecords(t *testing.T) {
 	}
 	if _, err := os.Stat(segment.SegmentPath(cfg.SegmentDir, 2)); !os.IsNotExist(err) {
 		t.Fatalf("segment 2 should not exist, stat err = %v", err)
+	}
+}
+
+func TestAutoCompactionTriggersPastThreshold(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1          // flush a new segment on every insert
+	cfg.CompactionSegmentThreshold = 4     // compact once live count exceeds 4
+
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	// Insert enough spans, each in its own segment (threshold=1), to cross
+	// the compaction threshold at least once.
+	for i := 0; i < 6; i++ {
+		s := testSpan("t1", fmt.Sprintf("s%d", i), int64(i*10))
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan(%d) error = %v", i, err)
+		}
+	}
+
+	live, err := wt.LiveSegments()
+	if err != nil {
+		t.Fatalf("LiveSegments() error = %v", err)
+	}
+	// 6 segments flushed; once count exceeded 4, the oldest half (of
+	// whatever the live count was at that trigger point) got merged into
+	// one. The live count afterward must be strictly less than 6 — proof a
+	// merge actually happened rather than every segment just accumulating.
+	if len(live) >= 6 {
+		t.Fatalf("LiveSegments() = %v (len %d), want fewer than 6 — compaction should have merged some", live, len(live))
+	}
+
+	// Every span must still be findable regardless of which segment (merged
+	// or original) now holds it — compaction must be invisible to readers.
+	for i := 0; i < 6; i++ {
+		spanID := fmt.Sprintf("s%d", i)
+		key := segment.CompositeKey("t1", spanID)
+		loc, err := wt.index.GetSpan([]byte(key))
+		if err != nil {
+			t.Fatalf("GetSpan(%s) error = %v", spanID, err)
+		}
+		reader, err := segment.OpenReader(segment.SegmentPath(cfg.SegmentDir, loc.SegmentID))
+		if err != nil {
+			t.Fatalf("OpenReader(segment %d) for %s error = %v", loc.SegmentID, spanID, err)
+		}
+		got, err := reader.ReadAt(loc.Offset)
+		reader.Close()
+		if err != nil {
+			t.Fatalf("ReadAt() for %s error = %v", spanID, err)
+		}
+		if got.SpanID != spanID {
+			t.Fatalf("ReadAt() for %s = %+v, want SpanID %s", spanID, got, spanID)
+		}
 	}
 }
 
