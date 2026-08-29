@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/GuhaneshT/WispTraceDB/compactor"
 	"github.com/GuhaneshT/WispTraceDB/pebble"
 	"github.com/GuhaneshT/WispTraceDB/segment"
 	"github.com/GuhaneshT/WispTraceDB/wal"
@@ -16,18 +17,20 @@ const (
 	defaultPebblePath       = "wisp_lsm"
 	defaultSegmentDir       = "segments"
 	defaultCheckpointPath   = "checkpoint.dat"
+	defaultManifestPath     = "manifest.dat"
 
 	// defaultSegmentFlushThreshold is a placeholder pending benchmarking,
 	defaultSegmentFlushThreshold = 1000
 )
 
 type WispTraceConfig struct {
-	WALPath                string
-	WALMaxSegmentSize      uint64
-	PebblePath             string
-	SegmentDir             string
-	CheckpointPath         string
-	SegmentFlushThreshold  int
+	WALPath               string
+	WALMaxSegmentSize     uint64
+	PebblePath            string
+	SegmentDir            string
+	CheckpointPath        string
+	ManifestPath          string
+	SegmentFlushThreshold int
 }
 
 type WispTrace struct {
@@ -39,6 +42,7 @@ type WispTrace struct {
 	wal        *wal.WAL
 	index      *pebble.DB
 	checkpoint *Checkpoint
+	manifest   *segment.Manifest
 
 	segmentWriter *segment.Writer
 	nextSegmentID uint64
@@ -55,6 +59,7 @@ func DefaultWispTraceConfig() WispTraceConfig {
 		PebblePath:            defaultPebblePath,
 		SegmentDir:            defaultSegmentDir,
 		CheckpointPath:        defaultCheckpointPath,
+		ManifestPath:          defaultManifestPath,
 		SegmentFlushThreshold: defaultSegmentFlushThreshold,
 	}
 }
@@ -74,6 +79,9 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 	}
 	if config.CheckpointPath == "" {
 		config.CheckpointPath = defaultCheckpointPath
+	}
+	if config.ManifestPath == "" {
+		config.ManifestPath = defaultManifestPath
 	}
 	if config.SegmentFlushThreshold == 0 {
 		config.SegmentFlushThreshold = defaultSegmentFlushThreshold
@@ -109,6 +117,7 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 		wal:           walInstance,
 		index:         indexInstance,
 		checkpoint:    checkpoint,
+		manifest:      segment.NewManifest(config.ManifestPath),
 		segmentWriter: segment.NewWriter(),
 		nextSegmentID: lastConfirmedSegment + 1,
 	}
@@ -122,25 +131,7 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 	return wt, nil
 }
 
-// recover rebuilds any buffered-but-unflushed state from the WAL after a
-// restart. Because RemoveSegmentsUpTo already pruned every WAL segment
-// covered by a confirmed flush (checkpoint.Save happens before that prune,
-// per flushSegmentLocked's ordering), wal.Replay() here only ever returns
-// the unconfirmed tail: spans that were durably appended to the WAL (step ①
-// of InsertSpan) but never completed a full flushSegmentLocked pass before
-// the process stopped.
-//
-// Without this, those spans would be silently invisible to segment/index
-// state even though the WAL still has them — exactly the gap PAD1 §3's
-// standing test rules out ("if every segment, index file, and rollup were
-// deleted right now, could correct state be fully reconstructed from the
-// WAL alone?").
-//
-// Recovered spans are flushed immediately (not merely re-buffered) so that
-// CreateWispTraceWithConfig never returns with an unconfirmed tail already
-// sitting in memory — the invariant after a successful call is always
-// "checkpoint == latest segment," the same as a fresh database with no
-// prior crash. Must be called before any InsertSpan is accepted.
+// recover rebuilds any buffered-but-unflushed state from the WAL after a restart.
 func (w *WispTrace) recover() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -216,6 +207,11 @@ func (w *WispTrace) flushSegmentLocked() error {
 		return fmt.Errorf("index segment %d: %w", result.SegmentID, err)
 	}
 
+	// Record the new segment as live before advancing the checkpoint
+	if err := w.manifest.AddSegment(result.SegmentID); err != nil {
+		return fmt.Errorf("record segment %d in manifest: %w", result.SegmentID, err)
+	}
+
 	if err := w.checkpoint.Save(result.SegmentID); err != nil {
 		return fmt.Errorf("save checkpoint at segment %d: %w", result.SegmentID, err)
 	}
@@ -229,6 +225,16 @@ func (w *WispTrace) flushSegmentLocked() error {
 	return nil
 }
 
+
+func (w *WispTrace) Compactor() *compactor.Compactor {
+	return compactor.New(w.config.SegmentDir, w.manifest, w.index)
+}
+
+// LiveSegments returns the current manifest contents — the segment ids a
+// compaction policy or query path should consider live.
+func (w *WispTrace) LiveSegments() ([]uint64, error) {
+	return w.manifest.Load()
+}
 
 func (w *WispTrace) Close() error {
 	var errs []error
