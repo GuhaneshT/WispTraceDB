@@ -94,10 +94,13 @@ func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 	if d.db == nil {
 		return nil, fmt.Errorf("pebble db is closed")
 	}
-	iter := d.db.NewIter(&pebble.IterOptions{
+	iter,err := d.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixUpperBound(prefix),
 	})
+	if err!=nil{
+		return nil,fmt.Errorf("Pebble Iterator error")
+	}
 	defer iter.Close()
 
 	locations := make([]SpanLocation, 0, 16)
@@ -108,8 +111,9 @@ func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 		}
 		locations = append(locations, location)
 	}
-	return locations, iter.Close()
+	return locations, nil
 }
+
 
 
 // DeleteSpan removes a span from the trace index (tombstone effect).
@@ -199,8 +203,14 @@ func decodeSpanLocation(data []byte) (SpanLocation, error) {
 
 
 func prefixUpperBound(prefix []byte) []byte {
-	upper := make([]byte, len(prefix)+1)
-	copy(upper, prefix)
-	upper[len(prefix)] = 0x00
-	return upper
+    upper := append([]byte(nil), prefix...)
+
+    for i := len(upper) - 1; i >= 0; i-- {
+        if upper[i] != 0xff {
+            upper[i]++
+            return upper[:i+1]
+        }
+    }
+
+    return nil
 }

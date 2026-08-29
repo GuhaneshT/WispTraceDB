@@ -1,7 +1,7 @@
 package pebble
 
 import (
-	"bytes"
+	// "bytes"
 	"path/filepath"
 	"testing"
 )
