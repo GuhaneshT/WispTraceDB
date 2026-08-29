@@ -1,0 +1,164 @@
+WispTraceDB v0 → v1 Checklist
+
+Major storage/recovery changes → coding agent
+Querying, tests, benchmarks, and small utilities → implement manually
+
+Manual Work 
+ GetSpan(traceID, spanID)
+Pebble lookup → SpanLocation → segment ReadAt() → decode span.
+ GetTrace(traceID)
+Use Pebble prefix scan to find all spans belonging to a trace.
+ Improve PrefixScan()
+Handle iterator errors correctly and test different prefixes.
+ Prefix scan isolation tests
+Verify trace-001 never returns entries from trace-002.
+ Empty-result tests
+Query a nonexistent trace and verify an empty result.
+ Time-range scan
+Use segment MinTimestamp / MaxTimestamp to skip irrelevant segments.
+ Basic filtering
+Add filters for status, model, agentID, and team.
+ Query structure
+Introduce a small Query struct instead of immediately building SQL.
+ GetTrace() ordering
+Decide and document whether results are ordered by timestamp, span ID, or storage order.
+ Basic CLI/query commands
+Add commands such as get-span, get-trace, and scan.
+ Benchmarks
+Benchmark insert, batch insert, point lookup, trace lookup, prefix scan, and segment reads.
+ WAL fsync benchmark
+Establish the performance difference between per-write sync and batched sync.
+ Recovery experiments
+Manually kill the process at different stages and verify data after restart.
+ Consistency-check CLI
+Build a simple check command around the consistency checker once the agent implements the core logic.
+Coding-Agent Work
+WAL and Recovery
+ Separate checkpoint from segment ID allocation
+Checkpoint represents recovery progress; segment IDs must never be reused.
+ Implement independent segment ID allocation
+Determine the next ID from existing segments/manifest rather than checkpoint state.
+ Add WAL position/LSN checkpoint
+Store SegmentID + Offset or an equivalent LSN.
+ Replay only after checkpoint
+Avoid replaying already-flushed WAL records.
+ Harden torn-tail recovery
+Ignore/truncate incomplete final records while treating completed-record corruption as an error.
+ Validate WAL record sizes
+Reject oversized/corrupt length fields before allocating memory.
+Flush Protocol
+ Define durability ordering
+WAL → segment → Pebble → manifest → checkpoint → WAL reclamation.
+ Make flush crash-safe
+Ensure every intermediate crash state can be recovered.
+ Add failure-injection tests
+Simulate failures after each durability step.
+ Verify WAL reclamation
+Never delete WAL records that might still be required for recovery.
+Manifest and Filesystem Recovery
+ Handle orphan segments
+Detect segment files left behind by failed flushes/compactions.
+ Handle temporary manifests
+Recover safely from interrupted atomic manifest replacement.
+ Clean abandoned compaction output
+Remove only files proven to be unreachable.
+ Validate manifest references
+Every live manifest segment must exist and be readable.
+Consistency
+ Implement CheckConsistency()
+Validate the relationship between Pebble, segments, and the manifest.
+ Validate Pebble locations
+Every (segmentID, offset) must reference a valid record.
+ Validate key/data consistency
+The span at an indexed location must match the Pebble key.
+ Validate segment metadata
+Check record count and timestamp metadata against actual contents.
+Segment Storage
+ Add maximum segment record size
+Prevent corrupted lengths from causing huge allocations.
+ Strengthen segment header validation
+Consider adding a header checksum.
+ Add segment footer
+Store record count, size, timestamp range, and checksum.
+ Validate incomplete segments
+Distinguish valid immutable segments from partially written files.
+Compaction
+ Verify compaction crash recovery
+Ensure output segments and index updates remain consistent after failure.
+ Verify segment ID allocation during compaction
+Compaction must never reuse an existing segment ID.
+ Benchmark compaction
+Measure CPU, I/O, write amplification, and temporary disk usage.
+ Investigate Pebble lookup overhead
+Current record-by-record index validation may become expensive at scale.
+v0 Hardening
+ WAL recovery passes crash tests.
+ Segment IDs are never reused.
+ Checkpoint correctly represents WAL progress.
+ Restart preserves committed data.
+ Compaction survives restart.
+ Pebble never references invalid segments.
+ Manifest recovery works.
+ Consistency checker reports a clean database.
+ Basic read/query path works.
+ Baseline benchmarks exist.
+v1 Performance
+ WAL group commit
+Batch multiple writes into one fsync.
+ Batch WAL writes by bytes/records/time
+Tune batching using benchmark results.
+ Segment timestamp pruning
+Avoid reading segments outside the query range.
+ Improve compaction strategy
+Move beyond the initial simple compaction policy based on benchmark results.
+ Reduce compaction index lookups
+Avoid unnecessary Pebble Get() operations.
+ Separate WAL and segment encoding
+Eventually optimize each format for its specific workload.
+v1 Storage
+ Separate SPAN_UPSERT and SPAN_DELETE
+Avoid storing a complete span for a tombstone.
+ Segment compression experiments
+Measure compression ratio and CPU cost before choosing a format.
+ Delta-of-delta timestamps
+Compress timestamp sequences.
+ Dictionary encoding
+Compress repeated strings such as model, team, and agent IDs.
+ RLE
+Compress repeated categorical values.
+ XOR float compression
+Consider for numeric fields such as cost.
+ Columnar segments
+Only after the row-oriented format and query semantics are stable.
+Do Not Work on Yet
+ SQL parser
+ Distributed database
+ Raft
+ Sharding
+ Vector/embedding search
+ Semantic search
+ Complex query optimizer
+ Cloud deployment
+ Advanced LSM compaction algorithms
+
+Recommended immediate sequence:
+
+GetSpan
+  ↓
+GetTrace
+  ↓
+PrefixScan tests
+  ↓
+Benchmarks
+  ↓
+Manual crash experiments
+  ↓
+Coding agent: recovery/checkpoint/segment-ID work
+  ↓
+Consistency checker
+  ↓
+Time-range queries
+  ↓
+Batch fsync
+  ↓
+Compression/columnar work
