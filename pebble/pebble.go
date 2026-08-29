@@ -54,8 +54,7 @@ func (d *DB) Close() error {
 }
 
 // PutSpan writes a span location into the trace index. key is trace_id||span_id
-// (concatenated strings), location is the segment_id and byte offset where the
-// span's data lives. Write is fsync'd before returning for crash-safe durability.
+
 func (d *DB) PutSpan(key []byte, location SpanLocation) error {
 	if d.db == nil {
 		return fmt.Errorf("pebble db is closed")
@@ -123,7 +122,7 @@ func (d *DB) DeleteSpan(key []byte) error {
 }
 
 // BatchPutSpans writes multiple span locations atomically. Used during segment
-// flush to index all spans of a segment in one transaction (PAD1 §4 reconciliation).
+// flush to index all spans of a segment in one transaction .
 // If the process crashes before Sync, none of the writes are visible; if it
 // crashes during Sync, the entire batch either commits or rolls back.
 func (d *DB) BatchPutSpans(entries map[string]SpanLocation) error {
