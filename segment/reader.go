@@ -12,22 +12,13 @@ import (
 )
 
 // Reader opens a finalized segment file for two access patterns:
-//   - ReadAt: a single point read by byte offset, exactly the offset half of
-//     the (segment_id, offset) pair PAD1 §4 stores in Pebble. This is the
-//     query-path read: point lookup already knows where to seek.
-//   - ScanAll: a full sequential read of every span in the segment. Used by
-//     crash recovery (rebuilding Pebble entries for the unconfirmed tail past
-//     the checkpoint watermark, PAD1 §4) and, later, by compaction (Phase 3)
-//     to read every span out of a segment being merged or dropped.
+//   - ReadAt: a single point read by byte offset.
+//   - ScanAll: a full sequential read of every span in the segment. For Crash recovery
 type Reader struct {
 	file   *os.File
 	Header SegmentHeader
 }
 
-// OpenReader opens a segment file and validates its header (magic + version)
-// before returning. A version mismatch is rejected explicitly, the same
-// posture as wal.replaySegment's version check — a segment written by an
-// incompatible future/past layout must never be silently misparsed.
 func OpenReader(path string) (*Reader, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -49,10 +40,7 @@ func (r *Reader) Close() error {
 }
 
 // ReadAt reads and decodes exactly one span record starting at the given
-// byte offset. offset is expected to be a value previously returned in a
-// WriteResult.Offsets map (equivalently, the offset half of a Pebble index
-// entry) — an arbitrary offset is not guaranteed to land on a record
-// boundary and will fail its checksum check if it doesn't.
+// byte offset.
 func (r *Reader) ReadAt(offset uint64) (wal.SpanPayload, error) {
 	var framing [recordFramingSize]byte
 	if _, err := r.file.ReadAt(framing[:], int64(offset)); err != nil {
@@ -73,8 +61,7 @@ func (r *Reader) ReadAt(offset uint64) (wal.SpanPayload, error) {
 }
 
 // ScannedSpan pairs a decoded span with the byte offset its record started
-// at — the same offset ReadAt expects and the same value a reconciliation
-// pass would index into Pebble.
+// at.
 type ScannedSpan struct {
 	Offset uint64
 	Span   wal.SpanPayload

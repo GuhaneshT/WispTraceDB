@@ -23,11 +23,7 @@ const (
 	// defaultSegmentFlushThreshold is a placeholder pending benchmarking,
 	defaultSegmentFlushThreshold = 1000
 
-	// defaultCompactionSegmentThreshold triggers a compaction pass once the
-	// live segment count exceeds this. A placeholder policy — merge the
-	// oldest half whenever this is crossed — pending real ingestion
-	// patterns, same posture as SegmentFlushThreshold (PAD1 §12 step 1's
-	// "pick a placeholder now, revisit once real usage exists").
+	// defaultCompactionSegmentThreshold triggers a compaction pass once the live segment count exceeds this
 	defaultCompactionSegmentThreshold = 10
 )
 
@@ -243,16 +239,8 @@ func (w *WispTrace) flushSegmentLocked() error {
 	return nil
 }
 
-// maybeCompactLocked runs a placeholder compaction policy: once the live
-// segment count exceeds CompactionSegmentThreshold, merge the oldest half of
-// the live set into one new segment. This is deliberately simple — pick a
-// number, merge that many of the oldest segments — pending real ingestion
-// patterns to benchmark against (same posture as SegmentFlushThreshold).
-// The mechanism it calls (compactor.Compact) is correct regardless of which
-// segments are chosen; only the choice of "oldest half, once over N" is a
-// placeholder here.
-//
-// Must be called with w.flushMu held (flushSegmentLocked already holds it).
+// Once the live segment count exceeds CompactionSegmentThreshold, merge the oldest half of
+// the live set into one new segment
 func (w *WispTrace) maybeCompactLocked() error {
 	live, err := w.manifest.Load()
 	if err != nil {

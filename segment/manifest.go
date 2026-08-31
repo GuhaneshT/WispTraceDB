@@ -9,13 +9,7 @@ import (
 )
 
 // Manifest is the on-disk record of which segment ids currently make up
-// live, queryable state — PAD1 §3's "atomically swap a pointer... from the
-// old segment set to the new one." Compaction is the only writer: it
-// computes the next segment set (old ids removed, any newly merged id
-// added) and calls Save, which is atomic (temp file + fsync + rename) —
-// a reader either sees the pre-compaction set in full or the
-// post-compaction set in full, never a partial one.
-//
+// live, queryable state
 // The manifest is derived state, same as cmd.Checkpoint: if it were lost,
 // the safe (if wasteful) fallback is treating every segment file found on
 // disk as live and rebuilding the manifest from that directory listing.
@@ -23,8 +17,7 @@ type Manifest struct {
 	path string
 }
 
-// NewManifest returns a Manifest backed by the given file path. The file is
-// not created until the first Save.
+// NewManifest returns a Manifest backed by the given file path
 func NewManifest(path string) *Manifest {
 	return &Manifest{path: path}
 }
@@ -50,10 +43,7 @@ func (m *Manifest) Load() ([]uint64, error) {
 }
 
 // Save durably replaces the manifest with the given segment ids (sorted
-// ascending on write, for a deterministic on-disk representation). Atomic —
-// temp file, fsync, then rename over the manifest path — the same pattern
-// as cmd.Checkpoint.Save, for the same reason: a crash mid-save must never
-// leave a torn manifest that a reader could observe.
+// ascending on write, for a deterministic on-disk representation)
 func (m *Manifest) Save(ids []uint64) error {
 	sorted := append([]uint64(nil), ids...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
@@ -90,10 +80,7 @@ func (m *Manifest) Save(ids []uint64) error {
 	return nil
 }
 
-// AddSegment idempotently records id as live: a no-op if id is already
-// present. Idempotency matters because a crash during flush can retry the
-// same segment id (see cmd.WispTrace.recover) — without this guard, retrying
-// an already-recorded add would duplicate the id in the manifest.
+// AddSegment idempotently records id as live
 func (m *Manifest) AddSegment(id uint64) error {
 	ids, err := m.Load()
 	if err != nil {
@@ -107,9 +94,7 @@ func (m *Manifest) AddSegment(id uint64) error {
 	return m.Save(append(ids, id))
 }
 
-// RemoveSegments returns a copy of ids with every id in remove filtered out.
-// Exported for the compactor package, which needs to compute "current live
-// set minus the segments just compacted away" before saving.
+
 func RemoveSegments(ids []uint64, remove []uint64) []uint64 {
 	removeSet := make(map[uint64]bool, len(remove))
 	for _, id := range remove {

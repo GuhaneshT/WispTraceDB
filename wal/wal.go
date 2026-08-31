@@ -137,16 +137,8 @@ func serializePayload(record WALRecord) ([]byte, error) {
 	return buf, nil
 }
 
-// EncodeSpanPayload serializes a span using the same field layout as a WAL
-// record's payload (encodePayload) — timestamp/tokens/cost/latency/deleted,
-// then the length-prefixed string fields, then the length-prefixed payload
-// blob. It does not include WAL-specific record framing (version byte,
-// crc32, length prefix); callers needing their own framing (e.g. the segment
-// writer) add it around this.
-//
-// Exported so the segment package can reuse the exact span wire format
-// instead of re-deriving it — one encoding to keep correct and to version,
-// not two copies that can silently drift apart.
+// EncodeSpanPayload serializes a span using the same field layout as a WAL record.
+
 func EncodeSpanPayload(span SpanPayload) []byte {
 	record := WALRecord{Span: span}
 	buf := make([]byte, payloadEncodedSize(record))
