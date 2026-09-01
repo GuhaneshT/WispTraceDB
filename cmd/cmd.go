@@ -282,15 +282,7 @@ func (f RangeFilter) matches(s wal.SpanPayload) bool {
 
 // RangeQuery returns every live (non-tombstoned) span matching filter, using
 // zone-map pruning to avoid opening segments whose timestamp range can't
-// overlap the query window (PAD1 §5/§7 — range queries never touch Pebble).
-//
-// Known trade-off, not a bug: because this never consults Pebble, a span
-// tombstoned by a separate record in a different, later segment can still
-// be returned here if that segment isn't touched by this query (e.g. its
-// own timestamp falls outside the window). This resolves itself once
-// compaction reclaims the stale copy (see compactor package doc); fixing it
-// here would mean a per-span Pebble lookup, which defeats the reason this
-// query type exists.
+// overlap the query window 
 func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -307,8 +299,7 @@ func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 			return nil, fmt.Errorf("open segment %d: %w", id, err)
 		}
 
-		// Zone-map pruning: skip this segment entirely if its timestamp
-		// range can't overlap the query window.
+		// Zone-map pruning
 		if reader.Header.MaxTimestamp < filter.StartTS || reader.Header.MinTimestamp > filter.EndTS {
 			reader.Close()
 			continue

@@ -1,5 +1,31 @@
 # Design Doc 1
-### Status: **FROZEN v1.2** — baseline for architecture and implementation
+### Status: **FROZEN v1.3** — baseline for architecture and implementation
+
+## Amendment v1.3 (additive — see PAD1.md v1.3 for the technical detail this tracks)
+
+- **USP claim 2 (§4) gains a concrete, structural differentiator:
+  root-attributed rollups.** Every reference system in §3's competitive
+  table rolls up flat span-level dimensions only; none use trace hierarchy
+  (parent-child span structure) as an aggregation-time input.
+  Root-attributed rollups — "total cost of a workflow started by Agent X,"
+  not just "cost of spans Agent X directly executed" — is a rollup shape
+  structurally unavailable to a schema-on-read system without it
+  independently reinventing trace-structure-aware aggregation. This
+  directly addresses the open risk in §4/§7: if the flat-rollup half of
+  claim 2 turns out to be something OpenObserve already does, this is the
+  part that doesn't reduce to "we also have rollups."
+- **Scope (§5)** — the "Aggregation queries" in-scope bullet now includes
+  root-attributed rollups as part of the rollup mechanism. No new data
+  model or WAL change; see PAD1.md v1.3 for the mechanism (reuses the
+  existing session-window eviction concept from Architecture doc §3).
+- Two alternative aggregation designs were evaluated and explicitly
+  deferred, not silently dropped: dimension-lattice rollups (rejected for
+  v1 — doesn't address the USP risk, adds row-count growth against this
+  doc's own scope-discipline principle, §7) and critical-path latency
+  (reclassified as a query-time trace-analysis feature, not a rollup,
+  since a correct answer needs the trace's leaves, which risk being
+  late-arriving at rollup-flush time). See PAD1.md v1.3 for the full
+  reasoning.
 
 ## Amendment v1.2 (additive — see PAD1.md v1.2 for the technical detail this tracks)
 
@@ -142,6 +168,13 @@ early implementation** — if OpenObserve already does typed rollups well,
 the USP shrinks to embeddability alone, which is a smaller, still-valid,
 but differently-scoped project.
 
+**Mitigation added in v1.3:** root-attributed rollups (Architecture doc
+v1.3) give claim 2 a structural component — trace-hierarchy-aware
+aggregation — that a flat, schema-on-read rollup can't trivially replicate
+without independently building the same trace-structure-aware mechanism.
+This doesn't remove the need to run the OpenObserve validation above; it
+reduces how much rides on that single validation's outcome.
+
 ---
 
 ## 5. Scope
@@ -155,6 +188,9 @@ but differently-scoped project.
   pruning, no separate tag index).
 - Aggregation queries (sum/avg/count/percentile), backed by continuously
   maintained rollups plus a payload-avoiding columnar scan fallback.
+  Rollups include root-attributed buckets (Architecture doc v1.3) that
+  aggregate a span's numeric fields under its trace root's dimensions, not
+  just its own — see Amendment v1.3 above.
 - Single static Go binary AND importable Go package.
 - Bearer-token auth, health/readiness endpoints, Prometheus-format
   operational metrics.
@@ -226,10 +262,15 @@ minutes" for anyone past a small trial dataset.
 v1.0 was the full scope of design discussion through initial freeze. v1.1
 was a deliberate, versioned amendment recording the naming decision and
 the architecture-side resolutions from PAD1.md v1.1 that this doc's risk
-and scope sections depend on. v1.2 (this version) adds tombstone support
-to v1 in-scope (§5), tracking PAD1.md v1.2's discovery that retention-
-driven segment expiry requires WAL-level tombstones regardless of whether
-a user-facing delete API ships. Any future change to objective, target
-user, USP claims, or v1 scope should be made as a further deliberate,
-versioned amendment — not a silent drift — given how much of the
-architecture doc depends on the scope boundaries fixed here.
+and scope sections depend on. v1.2 added tombstone support to v1 in-scope
+(§5), tracking PAD1.md v1.2's discovery that retention-driven segment
+expiry requires WAL-level tombstones regardless of whether a user-facing
+delete API ships. v1.3 (this version) adds root-attributed rollups to §4's
+USP claim 2 and §5's scope, tracking PAD1.md v1.3's discovery that trace
+hierarchy — already tracked via `parent_span_id` and unused by any named
+competitor at the aggregation layer — can give the weaker USP claim a
+structural component ahead of the still-unresolved OpenObserve validation.
+Any future change to objective, target user, USP claims, or v1 scope
+should be made as a further deliberate, versioned amendment — not a
+silent drift — given how much of the architecture doc depends on the
+scope boundaries fixed here.

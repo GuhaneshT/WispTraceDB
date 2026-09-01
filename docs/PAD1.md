@@ -1,7 +1,87 @@
 # Architecture Doc 1
-### Status: **FROZEN v1.2** — baseline for implementation
+### Status: **FROZEN v1.3** — baseline for implementation
 
 Defines the *how*. See `PDD1.md` for the *why*, *who*, and *what*.
+
+---
+
+## Amendment v1.3 (additive — strengthens §6's rollup design against the still-open USP risk flagged in Design doc §4/§7)
+
+**The gap this closes:** Design doc §4 flags claim 2 (typed columns + rollups)
+as unverified against OpenObserve, with an explicit fallback: "if
+OpenObserve already does typed rollups well, the USP shrinks to
+embeddability alone." A flat rollup — sum(cost) grouped by (agent_id,
+model, team, status) per time bucket — is exactly the kind of aggregate a
+schema-on-read system can add without a redesign. §13's reference systems
+confirm no named competitor (Tempo, Honeycomb, Jaeger, OpenObserve,
+SmithDB) does anything with a trace's own hierarchical structure
+(`parent_span_id`) at the aggregation layer — every one of them rolls up
+flat span-level dimensions only. Closing this gap strengthens the weaker
+USP claim with something structural, not just another metric.
+
+**Decision — root-attributed rollups, additive to the flat rollup tier
+already specified in §6:**
+
+- In addition to rolling a span's numeric fields (`cost`, `tokens_in`,
+  `tokens_out`, `latency_ms`) into its own flat dimension bucket, also roll
+  them into a bucket keyed by the span's **trace root's** dimensions
+  (`agent_id`, `model`, `team`) — answering "total cost of workflows
+  started by Agent X," not just "cost of spans Agent X directly executed."
+  This is the one aggregation shape none of §13's reference systems
+  support, because it requires the span/trace hierarchy this system
+  already tracks (§2's `parent_span_id`) as an aggregation-time input, not
+  just a display-time one.
+- **Mechanism reuses an existing concept rather than adding a new one:**
+  track each open trace's root-span dimensions in a small cache
+  (`trace_id → {agent_id, model, team}`), evicted on the same
+  session-window inactivity timeout already specified for segment
+  buffering (§3, Pillar 2) — not a second, bespoke expiry mechanism.
+- **Degrades gracefully, doesn't hard-fail, matching Pillar 1's existing
+  posture (§3):** a child span arriving before its trace's root
+  (out-of-order arrival, already an accepted case per §3's "not required:
+  ordering across concurrent writers") falls back to attributing under its
+  own dimensions if the root isn't cached yet. This is a completeness
+  trade-off, not a correctness one — no wrong number is ever produced,
+  only a potentially-conservative one until the root is seen.
+- **Rebuild story is identical to the flat tier's:** root-attributed
+  buckets rebuild the same way — replaying the WAL from the checkpoint
+  watermark forward (v1.1 amendment) — because the root cache itself is
+  derived from the same span stream, not a separate source of truth.
+- **No data-model or WAL-format change.** `parent_span_id` (§2) already
+  carries what's needed; this is purely an aggregation-layer addition.
+  Nothing here is expensive to retrofit later the way the v1.2 tombstone
+  gap was — that's exactly why this is safe to add now as a v1.3
+  amendment rather than needing to have been in v1.0.
+
+**Alternatives considered and their disposition** — recorded so this isn't
+re-litigated from scratch later:
+
+- **Dimension-lattice rollups** (precompute every combination of the 5
+  bounded dimensions — agent_id × model × tool_name × team × status — as
+  separate buckets, so any GROUP BY combination hits a precomputed
+  number). Rejected for v1: 2⁵ combinations per time bucket is real
+  row-count growth against this project's own principle (§7 / Design doc
+  §5) that "scope discipline matters more than feature completeness," and
+  it doesn't address the OpenObserve risk the way root-attribution does —
+  a bigger flat cube is still a flat cube. Not ruled out permanently;
+  revisit only if a real query pattern demonstrably needs an unsupported
+  combination.
+- **Critical-path latency** (trace-level end-to-end latency along the span
+  DAG's longest path, distinct from summing individual span latencies —
+  meaningful because parallel tool calls shouldn't add). Rejected as a
+  *rollup*: unlike root attribution (which only needs the root span,
+  arriving early in causal order), a correct critical path needs the
+  trace's leaves too, which are more likely to be late-arriving —
+  computing it at session-window flush time risks an incomplete,
+  silently-wrong answer, a correctness regression this system doesn't
+  tolerate elsewhere. This fits better as an on-demand computation over an
+  already-assembled trace (a function over the existing §4 point-lookup
+  path), not a continuously-maintained aggregate — deferred to the Query
+  API work (§12 step 6), not this amendment.
+
+**Scope implication for PDD1:** §4's USP claim 2 gains a concrete,
+structural differentiator beyond "we also have rollups" — see PDD1.md
+v1.3.
 
 ---
 
@@ -377,7 +457,11 @@ of long-lived, regularly-updated numeric series.
 
 - Continuously-maintained rolling windows (1m / 5m / 1h / 1d), updated as
   spans are ingested, for the common case where a query's window aligns to
-  a bucket.
+  a bucket. **Root-attributed rollups (v1.3):** each span updates its own
+  flat dimension bucket *and* a bucket keyed by its trace root's
+  `agent_id`/`model`/`team`, via a session-window-evicted `trace_id → root
+  dimensions` cache — see Amendment v1.3 for the full mechanism and the
+  alternatives (dimension-lattice, critical-path) considered and deferred.
 - Fallback: a direct columnar scan of numeric + dimension columns only
   (never payload), for windows that don't align — e.g. "last 47 minutes."
 
@@ -508,6 +592,9 @@ typical product roadmap — durability before features:
 5. **Rollups + aggregation fallback** (§6) — the USP-critical path;
    validate against real query patterns, not just the demo query. Rollup
    snapshotting at the checkpoint cadence (v1.1 amendment) belongs here.
+   **Root-attributed rollups (v1.3)** belong in this same step — the
+   root-dimension cache is populated from the same ingestion path already
+   being instrumented for the flat tier, not a separate pass.
 6. Query API, point/range/aggregation routing, embeddable-package
    ergonomics — lower risk, safe to iterate on quickly once 1–3 are solid.
 
@@ -551,15 +638,22 @@ whether the project's USP is two claims or one.
 v1.0 was the technical baseline. v1.1 was a deliberate, versioned
 amendment resolving four items flagged at the v1.0 freeze review: LSM
 library choice, startup-checkpoint requirement, rollup replay bound, and
-the missing version-tagging build-order slot. v1.2 (this version) closes a
-gap found during v1.1 build planning: tombstones were never specified,
-despite retention-driven segment expiry making them unavoidable in any v1
-deployment. v1.2 adds the `deleted` field to the §2 span schema, routes
+the missing version-tagging build-order slot. v1.2 closed a gap found
+during v1.1 build planning: tombstones were never specified, despite
+retention-driven segment expiry making them unavoidable in any v1
+deployment. v1.2 added the `deleted` field to the §2 span schema, routed
 tombstone writes through the existing §4 reconciliation protocol
-unchanged, and specifies segment/index co-deletion as part of §3's
-compaction. Per the v1.0 freeze note's own instruction that changes be
-deliberate amendments, not silent drift: any future change to the pillar
-structure, the trace-index/tag-index design, the payload-storage decision,
-the LSM boundary, the checkpoint mechanism, or the tombstone/co-deletion
-protocol introduced here should itself be a further deliberate, versioned
-amendment against this freeze.
+unchanged, and specified segment/index co-deletion as part of §3's
+compaction. v1.3 (this version) strengthens §6's rollup design with
+root-attributed rollups — using the trace/span hierarchy (§2's
+`parent_span_id`) as an aggregation-time input, which directly addresses
+the still-open USP risk flagged in Design doc §4/§7 (claim 2's flat rollup
+alone may not differentiate against a schema-on-read competitor). It also
+records two alternatives (dimension-lattice rollups, critical-path
+latency) considered and explicitly deferred, not silently dropped. Per the
+v1.0 freeze note's own instruction that changes be deliberate amendments,
+not silent drift: any future change to the pillar structure, the
+trace-index/tag-index design, the payload-storage decision, the LSM
+boundary, the checkpoint mechanism, the tombstone/co-deletion protocol, or
+the rollup/root-attribution design introduced here should itself be a
+further deliberate, versioned amendment against this freeze.
