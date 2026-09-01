@@ -250,6 +250,92 @@ func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
 
 	return spans, true, nil
 }
+// RangeFilter selects spans by time range and, optionally, bounded-cardinality
+// dimension values. An empty string on any dimension field means "don't
+// filter on this dimension."
+type RangeFilter struct {
+	StartTS, EndTS                        int64
+	AgentID, Model, ToolName, Team, Status string
+}
+
+func (f RangeFilter) matches(s wal.SpanPayload) bool {
+	if s.Timestamp < f.StartTS || s.Timestamp > f.EndTS {
+		return false
+	}
+	if f.AgentID != "" && s.AgentID != f.AgentID {
+		return false
+	}
+	if f.Model != "" && s.Model != f.Model {
+		return false
+	}
+	if f.ToolName != "" && s.ToolName != f.ToolName {
+		return false
+	}
+	if f.Team != "" && s.Team != f.Team {
+		return false
+	}
+	if f.Status != "" && s.Status != f.Status {
+		return false
+	}
+	return true
+}
+
+// RangeQuery returns every live (non-tombstoned) span matching filter, using
+// zone-map pruning to avoid opening segments whose timestamp range can't
+// overlap the query window (PAD1 §5/§7 — range queries never touch Pebble).
+//
+// Known trade-off, not a bug: because this never consults Pebble, a span
+// tombstoned by a separate record in a different, later segment can still
+// be returned here if that segment isn't touched by this query (e.g. its
+// own timestamp falls outside the window). This resolves itself once
+// compaction reclaims the stale copy (see compactor package doc); fixing it
+// here would mean a per-span Pebble lookup, which defeats the reason this
+// query type exists.
+func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	live, err := w.manifest.Load()
+	if err != nil {
+		return nil, fmt.Errorf("load manifest: %w", err)
+	}
+
+	var results []wal.SpanPayload
+	for _, id := range live {
+		reader, err := segment.OpenReader(segment.SegmentPath(w.config.SegmentDir, id))
+		if err != nil {
+			return nil, fmt.Errorf("open segment %d: %w", id, err)
+		}
+
+		// Zone-map pruning: skip this segment entirely if its timestamp
+		// range can't overlap the query window.
+		if reader.Header.MaxTimestamp < filter.StartTS || reader.Header.MinTimestamp > filter.EndTS {
+			reader.Close()
+			continue
+		}
+
+		spans, err := reader.ScanAll()
+		closeErr := reader.Close()
+		if err != nil {
+			return nil, fmt.Errorf("scan segment %d: %w", id, err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close segment %d reader: %w", id, closeErr)
+		}
+
+		for _, s := range spans {
+			if s.Span.Deleted {
+				continue
+			}
+			if filter.matches(s.Span) {
+				results = append(results, s.Span)
+			}
+		}
+	}
+
+	return results, nil
+}
+
 func (w *WispTrace) Flush() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

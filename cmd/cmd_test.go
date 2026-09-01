@@ -482,6 +482,145 @@ func TestGetTraceNotFoundReturnsFalseNoError(t *testing.T) {
 	}
 }
 
+func TestRangeQueryFiltersByTimeWindow(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	for i, ts := range []int64{100, 200, 300, 400} {
+		s := testSpan("t1", fmt.Sprintf("s%d", i), ts)
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan() error = %v", err)
+		}
+	}
+
+	got, err := wt.RangeQuery(RangeFilter{StartTS: 150, EndTS: 350})
+	if err != nil {
+		t.Fatalf("RangeQuery() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("RangeQuery() len = %d, want 2 (ts 200 and 300)", len(got))
+	}
+	for _, s := range got {
+		if s.Timestamp < 150 || s.Timestamp > 350 {
+			t.Fatalf("RangeQuery() returned out-of-window span: %+v", s)
+		}
+	}
+}
+
+func TestRangeQueryFiltersByDimension(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	a := testSpan("t1", "s1", 100)
+	a.Model = "claude-sonnet-5"
+	b := testSpan("t1", "s2", 110)
+	b.Model = "claude-haiku-4-5"
+
+	if err := wt.InsertSpan(a); err != nil {
+		t.Fatalf("InsertSpan(a) error = %v", err)
+	}
+	if err := wt.InsertSpan(b); err != nil {
+		t.Fatalf("InsertSpan(b) error = %v", err)
+	}
+
+	got, err := wt.RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, Model: "claude-haiku-4-5"})
+	if err != nil {
+		t.Fatalf("RangeQuery() error = %v", err)
+	}
+	if len(got) != 1 || got[0].SpanID != "s2" {
+		t.Fatalf("RangeQuery(Model=claude-haiku-4-5) = %+v, want just s2", got)
+	}
+}
+
+func TestRangeQueryExcludesTombstones(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	live := testSpan("t1", "s1", 100)
+	tombstone := testSpan("t1", "s2", 110)
+	tombstone.Deleted = true
+
+	if err := wt.InsertSpan(live); err != nil {
+		t.Fatalf("InsertSpan(live) error = %v", err)
+	}
+	if err := wt.InsertSpan(tombstone); err != nil {
+		t.Fatalf("InsertSpan(tombstone) error = %v", err)
+	}
+
+	got, err := wt.RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000})
+	if err != nil {
+		t.Fatalf("RangeQuery() error = %v", err)
+	}
+	if len(got) != 1 || got[0].SpanID != "s1" {
+		t.Fatalf("RangeQuery() = %+v, want just the live span s1", got)
+	}
+}
+
+func TestRangeQueryPrunesSegmentsOutsideWindow(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	// Segment 1: entirely before the query window.
+	if err := wt.InsertSpan(testSpan("t1", "old", 10)); err != nil {
+		t.Fatalf("InsertSpan(old) error = %v", err)
+	}
+	// Segment 2: inside the window.
+	if err := wt.InsertSpan(testSpan("t1", "in-window", 500)); err != nil {
+		t.Fatalf("InsertSpan(in-window) error = %v", err)
+	}
+
+	got, err := wt.RangeQuery(RangeFilter{StartTS: 400, EndTS: 600})
+	if err != nil {
+		t.Fatalf("RangeQuery() error = %v", err)
+	}
+	if len(got) != 1 || got[0].SpanID != "in-window" {
+		t.Fatalf("RangeQuery() = %+v, want just in-window", got)
+	}
+}
+
+func TestRangeQueryNoMatchesReturnsEmpty(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	if err := wt.InsertSpan(testSpan("t1", "s1", 100)); err != nil {
+		t.Fatalf("InsertSpan() error = %v", err)
+	}
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	got, err := wt.RangeQuery(RangeFilter{StartTS: 900, EndTS: 1000})
+	if err != nil {
+		t.Fatalf("RangeQuery() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("RangeQuery() = %+v, want empty", got)
+	}
+}
+
 func TestGetSpanFindsTombstonedSpanWithDeletedSet(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.SegmentFlushThreshold = 1
