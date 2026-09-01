@@ -209,13 +209,7 @@ func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found
 	return span, true, nil
 }
 
-// GetTrace reconstructs a full trace by ID: a Pebble prefix scan for every
-// span's (segment_id, offset) (PAD1 §4), then reads each one. Spans of one
-// trace are commonly scattered across several segments (arrival order
-// interleaves concurrent traces — see PAD1 §4), so this opens one
-// segment.Reader per DISTINCT segment touched, not one per span; a trace
-// whose spans all happen to live in the same segment still only opens that
-// file once. found is false only when the trace has no indexed spans at all.
+// GetTrace reconstructs a full trace by ID
 func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
