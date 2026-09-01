@@ -621,6 +621,43 @@ func TestRangeQueryNoMatchesReturnsEmpty(t *testing.T) {
 	}
 }
 
+func TestRangeQueryBloomPruningDoesNotAffectCorrectness(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	a := testSpan("t1", "s1", 100)
+	a.AgentID = "agent-real"
+	if err := wt.InsertSpan(a); err != nil {
+		t.Fatalf("InsertSpan() error = %v", err)
+	}
+
+	// AgentID never inserted anywhere — every segment's bloom filter should
+	// definitively rule it out, so this must return empty without erroring,
+	// regardless of whether the timestamp window would otherwise match.
+	got, err := wt.RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, AgentID: "agent-that-does-not-exist"})
+	if err != nil {
+		t.Fatalf("RangeQuery() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("RangeQuery(AgentID=nonexistent) = %+v, want empty", got)
+	}
+
+	// Sanity: the real value still matches — bloom pruning must never
+	// produce a false negative on an actually-present value.
+	got, err = wt.RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, AgentID: "agent-real"})
+	if err != nil {
+		t.Fatalf("RangeQuery() error = %v", err)
+	}
+	if len(got) != 1 || got[0].AgentID != "agent-real" {
+		t.Fatalf("RangeQuery(AgentID=agent-real) = %+v, want just the real span", got)
+	}
+}
+
 func TestGetSpanFindsTombstonedSpanWithDeletedSet(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.SegmentFlushThreshold = 1

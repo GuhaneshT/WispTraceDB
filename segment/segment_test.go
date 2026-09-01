@@ -194,6 +194,95 @@ func TestFlushFailureRemovesPartialFile(t *testing.T) {
 	}
 }
 
+func TestReaderBloomsContainInsertedDimensionValues(t *testing.T) {
+	dir := t.TempDir()
+	w := NewWriter()
+
+	spans := []wal.SpanPayload{
+		makeSpan("t1", "s1", 100), // AgentID=agent-1, Model=claude-sonnet-5, etc.
+	}
+	other := makeSpan("t1", "s2", 110)
+	other.AgentID = "agent-2"
+	other.Model = "gpt-4"
+	spans = append(spans, other)
+
+	for _, s := range spans {
+		w.Add(s)
+	}
+	result, err := w.Flush(dir, 1)
+	if err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	reader, err := OpenReader(result.Path)
+	if err != nil {
+		t.Fatalf("OpenReader() error = %v", err)
+	}
+	defer reader.Close()
+
+	if len(reader.Blooms) != len(BloomDimensions) {
+		t.Fatalf("len(Blooms) = %d, want %d", len(reader.Blooms), len(BloomDimensions))
+	}
+
+	for _, dim := range BloomDimensions {
+		if _, ok := reader.Blooms[dim]; !ok {
+			t.Fatalf("Blooms missing dimension %s", dim)
+		}
+	}
+
+	if !reader.Blooms["agent_id"].MayContain("agent-1") {
+		t.Fatal("agent_id bloom should contain agent-1")
+	}
+	if !reader.Blooms["agent_id"].MayContain("agent-2") {
+		t.Fatal("agent_id bloom should contain agent-2")
+	}
+	if !reader.Blooms["model"].MayContain("gpt-4") {
+		t.Fatal("model bloom should contain gpt-4")
+	}
+	if reader.Blooms["agent_id"].MayContain("agent-that-was-never-inserted") {
+		t.Fatal("agent_id bloom should not claim to contain a value never added")
+	}
+}
+
+func TestScanAllSkipsPastBloomSection(t *testing.T) {
+	dir := t.TempDir()
+	w := NewWriter()
+	spans := []wal.SpanPayload{
+		makeSpan("t1", "s1", 100),
+		makeSpan("t1", "s2", 110),
+	}
+	for _, s := range spans {
+		w.Add(s)
+	}
+	result, err := w.Flush(dir, 1)
+	if err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	reader, err := OpenReader(result.Path)
+	if err != nil {
+		t.Fatalf("OpenReader() error = %v", err)
+	}
+	defer reader.Close()
+
+	if reader.Header.BloomSectionLength == 0 {
+		t.Fatal("BloomSectionLength = 0, want > 0 (5 filters were embedded)")
+	}
+
+	scanned, err := reader.ScanAll()
+	if err != nil {
+		t.Fatalf("ScanAll() error = %v", err)
+	}
+	if len(scanned) != len(spans) {
+		t.Fatalf("ScanAll() len = %d, want %d — bloom section must not leak into record parsing", len(scanned), len(spans))
+	}
+	for i, want := range spans {
+		if scanned[i].Span.SpanID != want.SpanID {
+			t.Fatalf("ScanAll()[%d].SpanID = %s, want %s", i, scanned[i].Span.SpanID, want.SpanID)
+		}
+	}
+}
+
 func TestCompositeKeyMatchesTraceAndSpan(t *testing.T) {
 	key := CompositeKey("trace-abc", "span-123")
 	if key != "trace-abc||span-123" {

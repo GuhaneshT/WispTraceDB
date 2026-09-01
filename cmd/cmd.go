@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/GuhaneshT/WispTraceDB/bloom"
 	"github.com/GuhaneshT/WispTraceDB/compactor"
 	"github.com/GuhaneshT/WispTraceDB/pebble"
 	"github.com/GuhaneshT/WispTraceDB/segment"
@@ -280,6 +281,32 @@ func (f RangeFilter) matches(s wal.SpanPayload) bool {
 	return true
 }
 
+func (f RangeFilter) mayMatchBlooms(blooms map[string]*bloom.Filter) bool {
+	checks := []struct {
+		dim   string
+		value string
+	}{
+		{"agent_id", f.AgentID},
+		{"model", f.Model},
+		{"tool_name", f.ToolName},
+		{"team", f.Team},
+		{"status", f.Status},
+	}
+	for _, c := range checks {
+		if c.value == "" {
+			continue
+		}
+		filter, ok := blooms[c.dim]
+		if !ok {
+			continue // no filter for this dimension — can't prune, don't block
+		}
+		if !filter.MayContain(c.value) {
+			return false
+		}
+	}
+	return true
+}
+
 // RangeQuery returns every live (non-tombstoned) span matching filter, using
 // zone-map pruning to avoid opening segments whose timestamp range can't
 // overlap the query window 
@@ -299,8 +326,17 @@ func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 			return nil, fmt.Errorf("open segment %d: %w", id, err)
 		}
 
-		// Zone-map pruning
+		// Zone-map pruning: skip if this segment's timestamp range can't
+		// overlap the query window.
 		if reader.Header.MaxTimestamp < filter.StartTS || reader.Header.MinTimestamp > filter.EndTS {
+			reader.Close()
+			continue
+		}
+
+		// Bloom pruning: skip if any requested dimension value is
+		// definitely absent from this segment. A "maybe" on every requested
+		// dimension falls through to the real scan below.
+		if !filter.mayMatchBlooms(reader.Blooms) {
 			reader.Close()
 			continue
 		}
