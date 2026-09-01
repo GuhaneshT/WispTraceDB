@@ -348,6 +348,75 @@ func TestAutoCompactionTriggersPastThreshold(t *testing.T) {
 	}
 }
 
+func TestGetSpanReturnsInsertedSpan(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	want := testSpan("trace-x", "span-x", 555)
+	if err := wt.InsertSpan(want); err != nil {
+		t.Fatalf("InsertSpan() error = %v", err)
+	}
+
+	got, found, err := wt.GetSpan("trace-x", "span-x")
+	if err != nil {
+		t.Fatalf("GetSpan() error = %v", err)
+	}
+	if !found {
+		t.Fatal("GetSpan() found = false, want true")
+	}
+	if got.TraceID != want.TraceID || got.SpanID != want.SpanID || got.Cost != want.Cost {
+		t.Fatalf("GetSpan() = %+v, want %+v", got, want)
+	}
+}
+
+func TestGetSpanNotFoundReturnsFalseNoError(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	got, found, err := wt.GetSpan("nonexistent", "nonexistent")
+	if err != nil {
+		t.Fatalf("GetSpan() error = %v, want nil for a missing key", err)
+	}
+	if found {
+		t.Fatalf("GetSpan() found = true, want false, got %+v", got)
+	}
+}
+
+func TestGetSpanFindsTombstonedSpanWithDeletedSet(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	tombstone := testSpan("trace-x", "span-x", 555)
+	tombstone.Deleted = true
+	if err := wt.InsertSpan(tombstone); err != nil {
+		t.Fatalf("InsertSpan() error = %v", err)
+	}
+
+	got, found, err := wt.GetSpan("trace-x", "span-x")
+	if err != nil {
+		t.Fatalf("GetSpan() error = %v", err)
+	}
+	if !found {
+		t.Fatal("GetSpan() found = false, want true — a tombstone is still an indexed record, not absent")
+	}
+	if !got.Deleted {
+		t.Fatal("GetSpan().Deleted = false, want true")
+	}
+}
+
 func TestPointLookupThroughSegmentReader(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.SegmentFlushThreshold = 1 // flush every span, simplest case

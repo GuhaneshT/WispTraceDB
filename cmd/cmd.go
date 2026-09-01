@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -48,7 +49,6 @@ type WispTrace struct {
 	index      *pebble.DB
 	checkpoint *Checkpoint
 	manifest   *segment.Manifest
-
 	segmentWriter *segment.Writer
 	nextSegmentID uint64
 }
@@ -182,6 +182,37 @@ func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
 	return nil
 }
 
+// GetSpan looks up one span by trace_id+span_id: a Pebble point lookup for
+// its (segment_id, offset), then a single read at that offset (PAD1 §4 —
+// the only query type that touches the LSM). found is false only when the
+// key isn't in the index at all; a tombstoned span still comes back found,
+// with Deleted set on the returned payload, so callers can distinguish
+// "never existed" from "existed, then deleted."
+func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found bool, err error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	key := []byte(segment.CompositeKey(traceID, spanID))
+	location, err := w.index.GetSpan(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return wal.SpanPayload{}, false, nil
+		}
+		return wal.SpanPayload{}, false, fmt.Errorf("index lookup: %w", err)
+	}
+
+	reader, err := segment.OpenReader(segment.SegmentPath(w.config.SegmentDir, location.SegmentID))
+	if err != nil {
+		return wal.SpanPayload{}, false, fmt.Errorf("open segment %d: %w", location.SegmentID, err)
+	}
+	defer reader.Close()
+
+	span, err = reader.ReadAt(location.Offset)
+	if err != nil {
+		return wal.SpanPayload{}, false, fmt.Errorf("read span at segment %d offset %d: %w", location.SegmentID, location.Offset, err)
+	}
+	return span, true, nil
+}
 
 func (w *WispTrace) Flush() error {
 	w.mu.Lock()
