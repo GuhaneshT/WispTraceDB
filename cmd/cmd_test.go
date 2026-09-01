@@ -390,6 +390,98 @@ func TestGetSpanNotFoundReturnsFalseNoError(t *testing.T) {
 	}
 }
 
+func TestGetTraceReconstructsSpansScatteredAcrossSegments(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1 // every InsertSpan flushes its own segment
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	// Interleave spans from two traces across separate flushes, mirroring
+	// real arrival order — trace-1's spans must end up in different segments.
+	spans := []wal.SpanPayload{
+		testSpan("trace-1", "span-1", 100),
+		testSpan("trace-2", "span-1", 105),
+		testSpan("trace-1", "span-2", 110),
+		testSpan("trace-1", "span-3", 120),
+	}
+	for _, s := range spans {
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan() error = %v", err)
+		}
+	}
+
+	got, found, err := wt.GetTrace("trace-1")
+	if err != nil {
+		t.Fatalf("GetTrace() error = %v", err)
+	}
+	if !found {
+		t.Fatal("GetTrace() found = false, want true")
+	}
+	if len(got) != 3 {
+		t.Fatalf("GetTrace() returned %d spans, want 3", len(got))
+	}
+
+	gotIDs := make(map[string]bool, len(got))
+	for _, s := range got {
+		if s.TraceID != "trace-1" {
+			t.Fatalf("GetTrace(trace-1) returned a span from %s", s.TraceID)
+		}
+		gotIDs[s.SpanID] = true
+	}
+	for _, want := range []string{"span-1", "span-2", "span-3"} {
+		if !gotIDs[want] {
+			t.Fatalf("GetTrace() missing %s, got %v", want, gotIDs)
+		}
+	}
+}
+
+func TestGetTraceMultipleSpansInSameSegment(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 10 // all spans land in one segment
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	for i := 0; i < 3; i++ {
+		s := testSpan("trace-1", fmt.Sprintf("span-%d", i), int64(i*10))
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan(%d) error = %v", i, err)
+		}
+	}
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	got, found, err := wt.GetTrace("trace-1")
+	if err != nil {
+		t.Fatalf("GetTrace() error = %v", err)
+	}
+	if !found || len(got) != 3 {
+		t.Fatalf("GetTrace() = (found=%v, len=%d), want (true, 3)", found, len(got))
+	}
+}
+
+func TestGetTraceNotFoundReturnsFalseNoError(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	got, found, err := wt.GetTrace("nonexistent-trace")
+	if err != nil {
+		t.Fatalf("GetTrace() error = %v, want nil for a missing trace", err)
+	}
+	if found {
+		t.Fatalf("GetTrace() found = true, want false, got %v", got)
+	}
+}
+
 func TestGetSpanFindsTombstonedSpanWithDeletedSet(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.SegmentFlushThreshold = 1

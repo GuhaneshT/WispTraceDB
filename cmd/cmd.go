@@ -182,12 +182,7 @@ func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
 	return nil
 }
 
-// GetSpan looks up one span by trace_id+span_id: a Pebble point lookup for
-// its (segment_id, offset), then a single read at that offset (PAD1 §4 —
-// the only query type that touches the LSM). found is false only when the
-// key isn't in the index at all; a tombstoned span still comes back found,
-// with Deleted set on the returned payload, so callers can distinguish
-// "never existed" from "existed, then deleted."
+// GetSpan looks up one span by trace_id+span_id
 func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found bool, err error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -214,6 +209,53 @@ func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found
 	return span, true, nil
 }
 
+// GetTrace reconstructs a full trace by ID: a Pebble prefix scan for every
+// span's (segment_id, offset) (PAD1 §4), then reads each one. Spans of one
+// trace are commonly scattered across several segments (arrival order
+// interleaves concurrent traces — see PAD1 §4), so this opens one
+// segment.Reader per DISTINCT segment touched, not one per span; a trace
+// whose spans all happen to live in the same segment still only opens that
+// file once. found is false only when the trace has no indexed spans at all.
+func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	prefix := []byte(segment.CompositeKey(traceID, ""))
+	locations, err := w.index.PrefixScan(prefix)
+	if err != nil {
+		return nil, false, fmt.Errorf("index prefix scan: %w", err)
+	}
+	if len(locations) == 0 {
+		return nil, false, nil
+	}
+
+	readers := make(map[uint64]*segment.Reader)
+	defer func() {
+		for _, r := range readers {
+			r.Close()
+		}
+	}()
+
+	spans := make([]wal.SpanPayload, 0, len(locations))
+	for _, loc := range locations {
+		reader, ok := readers[loc.SegmentID]
+		if !ok {
+			reader, err = segment.OpenReader(segment.SegmentPath(w.config.SegmentDir, loc.SegmentID))
+			if err != nil {
+				return nil, false, fmt.Errorf("open segment %d: %w", loc.SegmentID, err)
+			}
+			readers[loc.SegmentID] = reader
+		}
+
+		span, err := reader.ReadAt(loc.Offset)
+		if err != nil {
+			return nil, false, fmt.Errorf("read span at segment %d offset %d: %w", loc.SegmentID, loc.Offset, err)
+		}
+		spans = append(spans, span)
+	}
+
+	return spans, true, nil
+}
 func (w *WispTrace) Flush() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
