@@ -9,6 +9,11 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
+// ErrNotFound is returned by GetSpan when a key isn't in the index. Exported
+// so callers outside this package can check it with errors.Is without
+// importing the underlying cockroachdb/pebble library themselves.
+var ErrNotFound = pebble.ErrNotFound
+
 // SpanLocation is the value stored in Pebble
 type SpanLocation struct {
 	SegmentID uint64
