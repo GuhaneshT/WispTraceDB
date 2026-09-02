@@ -32,6 +32,8 @@ Establish the performance difference between per-write sync and batched sync.
 Manually kill the process at different stages and verify data after restart.
  Consistency-check CLI
 Build a simple check command around the consistency checker once the agent implements the core logic.
+
+
 Coding-Agent Work
 WAL and Recovery
  Separate checkpoint from segment ID allocation

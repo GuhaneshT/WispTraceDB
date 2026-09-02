@@ -61,7 +61,7 @@ type WriteResult struct {
 }
 
 type Writer struct {
-	spans []wal.SpanPayload
+	spans []wal.SpanPayloa
 }
 
 func NewWriter() *Writer {
