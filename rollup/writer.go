@@ -47,30 +47,34 @@ func (w *Writer) Len() int {
 	return len(w.aggregatedMetrics)
 }
 
-func RollupPath(dir string, rollupID uint64) string {
-	return filepath.Join(dir, fmt.Sprintf("rollup_%06d.rdb", rollupID))
+// RollupPath returns the canonical filesystem path for a rollup snapshot.
+// Uses ".rdb" (rollup database) to distinguish from ".seg" segment files.
+// The file is named after the window size, e.g., "rollup_1m.rdb".
+func RollupPath(dir string, window string) string {
+	return filepath.Join(dir, fmt.Sprintf("rollup_%s.rdb", window))
 }
 
 func CompositeKey(windowStart int64, model string) string {
 	return fmt.Sprintf("%d||%s", windowStart, model)
 }
 
-func (w *Writer) Flush(dir string, rollupID uint64, windowSize int64) error {
+func (w *Writer) Flush(dir string, window string, windowSize int64) error {
 	if len(w.aggregatedMetrics) == 0 {
 		return fmt.Errorf("rollup writer: flush called with no buffered metrics")
 	}
 
-	path := RollupPath(dir, rollupID)
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	path := RollupPath(dir, window)
+	tmpPath := path + ".tmp"
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("create rollup file: %w", err)
+		return fmt.Errorf("create rollup temp file: %w", err)
 	}
 
 	success := false
 	defer func() {
 		file.Close()
 		if !success {
-			os.Remove(path)
+			os.Remove(tmpPath)
 		}
 	}()
 
@@ -100,7 +104,14 @@ func (w *Writer) Flush(dir string, rollupID uint64, windowSize int64) error {
 		return fmt.Errorf("flush rollup buffer: %w", err)
 	}
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("fsync rollup file: %w", err)
+		return fmt.Errorf("fsync rollup temp file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close rollup temp file: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename temp rollup file: %w", err)
 	}
 
 	success = true

@@ -105,11 +105,11 @@ func TestWriterRoundTrip(t *testing.T) {
 		w.Add(AggregatedMetrics{BucketKey: key, Value: *val})
 	}
 
-	if err := w.Flush(dir, 1, WindowSizeMinute); err != nil {
+	if err := w.Flush(dir, WindowMinute, WindowSizeMinute); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	loaded, err := ReadSnapshot(RollupPath(dir, 1), WindowSizeMinute)
+	loaded, err := ReadSnapshot(RollupPath(dir, WindowMinute), WindowSizeMinute)
 	if err != nil {
 		t.Fatalf("ReadSnapshot: %v", err)
 	}
@@ -139,12 +139,12 @@ func TestWriterWrongWindowSizeRejected(t *testing.T) {
 		BucketKey: BucketKey{WindowStart: 0, Model: "gpt-4o"},
 		Value:     Value{Count: 1, MinLatencyMs: 100, MaxLatencyMs: 100},
 	})
-	if err := w.Flush(dir, 1, WindowSizeMinute); err != nil {
+	if err := w.Flush(dir, WindowMinute, WindowSizeMinute); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
 	// Try loading with the wrong window size (1h instead of 1m).
-	if _, err := ReadSnapshot(RollupPath(dir, 1), WindowSizeHour); err == nil {
+	if _, err := ReadSnapshot(RollupPath(dir, WindowMinute), WindowSizeHour); err == nil {
 		t.Fatal("want error when loading with mismatched windowSize, got nil")
 	}
 }
@@ -155,10 +155,10 @@ func TestWriterEmptyFlushErrors(t *testing.T) {
 	dir := t.TempDir()
 	w := NewWriter()
 
-	if err := w.Flush(dir, 1, WindowSizeMinute); err == nil {
+	if err := w.Flush(dir, WindowMinute, WindowSizeMinute); err == nil {
 		t.Fatal("want error flushing empty writer, got nil")
 	}
-	if _, err := os.Stat(RollupPath(dir, 1)); !os.IsNotExist(err) {
+	if _, err := os.Stat(RollupPath(dir, WindowMinute)); !os.IsNotExist(err) {
 		t.Fatal("want no rollup file after failed flush, but file exists")
 	}
 }
