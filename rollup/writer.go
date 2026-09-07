@@ -47,9 +47,6 @@ func (w *Writer) Len() int {
 	return len(w.aggregatedMetrics)
 }
 
-// RollupPath returns the canonical filesystem path for a rollup snapshot.
-// Uses ".rdb" (rollup database) to distinguish from ".seg" segment files.
-// The file is named after the window size, e.g., "rollup_1m.rdb".
 func RollupPath(dir string, window string) string {
 	return filepath.Join(dir, fmt.Sprintf("rollup_%s.rdb", window))
 }

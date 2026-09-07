@@ -56,6 +56,7 @@ func TestInsertSpanTriggersFlushAtThreshold(t *testing.T) {
 			t.Fatalf("InsertSpan() error = %v", err)
 		}
 	}
+	wt.WaitForIngest()
 
 	// After the flush, segment 1 should exist and be indexed in Pebble.
 	if wt.nextSegmentID != 2 {
@@ -201,6 +202,7 @@ func TestRecoverReplaysUnflushedSpansAfterRestart(t *testing.T) {
 			t.Fatalf("InsertSpan() error = %v", err)
 		}
 	}
+	wt.WaitForIngest()
 
 	// Sanity check: nothing has been flushed or indexed yet — these spans
 	// only exist in the WAL and in segmentWriter's in-memory buffer.
@@ -312,7 +314,7 @@ func TestAutoCompactionTriggersPastThreshold(t *testing.T) {
 		}
 	}
 
-	live, err := wt.LiveSegments()
+	live, err := wt.WaitForIngest().LiveSegments()
 	if err != nil {
 		t.Fatalf("LiveSegments() error = %v", err)
 	}
@@ -362,7 +364,7 @@ func TestGetSpanReturnsInsertedSpan(t *testing.T) {
 		t.Fatalf("InsertSpan() error = %v", err)
 	}
 
-	got, found, err := wt.GetSpan("trace-x", "span-x")
+	got, found, err := wt.WaitForIngest().GetSpan("trace-x", "span-x")
 	if err != nil {
 		t.Fatalf("GetSpan() error = %v", err)
 	}
@@ -381,7 +383,7 @@ func TestGetSpanNotFoundReturnsFalseNoError(t *testing.T) {
 	}
 	defer wt.Close()
 
-	got, found, err := wt.GetSpan("nonexistent", "nonexistent")
+	got, found, err := wt.WaitForIngest().GetSpan("nonexistent", "nonexistent")
 	if err != nil {
 		t.Fatalf("GetSpan() error = %v, want nil for a missing key", err)
 	}
@@ -412,8 +414,9 @@ func TestGetTraceReconstructsSpansScatteredAcrossSegments(t *testing.T) {
 			t.Fatalf("InsertSpan() error = %v", err)
 		}
 	}
+	wt.WaitForIngest()
 
-	got, found, err := wt.GetTrace("trace-1")
+	got, found, err := wt.WaitForIngest().GetTrace("trace-1")
 	if err != nil {
 		t.Fatalf("GetTrace() error = %v", err)
 	}
@@ -457,7 +460,7 @@ func TestGetTraceMultipleSpansInSameSegment(t *testing.T) {
 		t.Fatalf("Flush() error = %v", err)
 	}
 
-	got, found, err := wt.GetTrace("trace-1")
+	got, found, err := wt.WaitForIngest().GetTrace("trace-1")
 	if err != nil {
 		t.Fatalf("GetTrace() error = %v", err)
 	}
@@ -473,7 +476,7 @@ func TestGetTraceNotFoundReturnsFalseNoError(t *testing.T) {
 	}
 	defer wt.Close()
 
-	got, found, err := wt.GetTrace("nonexistent-trace")
+	got, found, err := wt.WaitForIngest().GetTrace("nonexistent-trace")
 	if err != nil {
 		t.Fatalf("GetTrace() error = %v, want nil for a missing trace", err)
 	}
@@ -498,7 +501,7 @@ func TestRangeQueryFiltersByTimeWindow(t *testing.T) {
 		}
 	}
 
-	got, err := wt.RangeQuery(RangeFilter{StartTS: 150, EndTS: 350})
+	got, err := wt.WaitForIngest().RangeQuery(RangeFilter{StartTS: 150, EndTS: 350})
 	if err != nil {
 		t.Fatalf("RangeQuery() error = %v", err)
 	}
@@ -533,7 +536,7 @@ func TestRangeQueryFiltersByDimension(t *testing.T) {
 		t.Fatalf("InsertSpan(b) error = %v", err)
 	}
 
-	got, err := wt.RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, Model: "claude-haiku-4-5"})
+	got, err := wt.WaitForIngest().RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, Model: "claude-haiku-4-5"})
 	if err != nil {
 		t.Fatalf("RangeQuery() error = %v", err)
 	}
@@ -562,7 +565,7 @@ func TestRangeQueryExcludesTombstones(t *testing.T) {
 		t.Fatalf("InsertSpan(tombstone) error = %v", err)
 	}
 
-	got, err := wt.RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000})
+	got, err := wt.WaitForIngest().RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000})
 	if err != nil {
 		t.Fatalf("RangeQuery() error = %v", err)
 	}
@@ -589,7 +592,7 @@ func TestRangeQueryPrunesSegmentsOutsideWindow(t *testing.T) {
 		t.Fatalf("InsertSpan(in-window) error = %v", err)
 	}
 
-	got, err := wt.RangeQuery(RangeFilter{StartTS: 400, EndTS: 600})
+	got, err := wt.WaitForIngest().RangeQuery(RangeFilter{StartTS: 400, EndTS: 600})
 	if err != nil {
 		t.Fatalf("RangeQuery() error = %v", err)
 	}
@@ -612,7 +615,7 @@ func TestRangeQueryNoMatchesReturnsEmpty(t *testing.T) {
 		t.Fatalf("Flush() error = %v", err)
 	}
 
-	got, err := wt.RangeQuery(RangeFilter{StartTS: 900, EndTS: 1000})
+	got, err := wt.WaitForIngest().RangeQuery(RangeFilter{StartTS: 900, EndTS: 1000})
 	if err != nil {
 		t.Fatalf("RangeQuery() error = %v", err)
 	}
@@ -639,7 +642,7 @@ func TestRangeQueryBloomPruningDoesNotAffectCorrectness(t *testing.T) {
 	// AgentID never inserted anywhere — every segment's bloom filter should
 	// definitively rule it out, so this must return empty without erroring,
 	// regardless of whether the timestamp window would otherwise match.
-	got, err := wt.RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, AgentID: "agent-that-does-not-exist"})
+	got, err := wt.WaitForIngest().RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, AgentID: "agent-that-does-not-exist"})
 	if err != nil {
 		t.Fatalf("RangeQuery() error = %v", err)
 	}
@@ -649,7 +652,7 @@ func TestRangeQueryBloomPruningDoesNotAffectCorrectness(t *testing.T) {
 
 	// Sanity: the real value still matches — bloom pruning must never
 	// produce a false negative on an actually-present value.
-	got, err = wt.RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, AgentID: "agent-real"})
+	got, err = wt.WaitForIngest().RangeQuery(RangeFilter{StartTS: 0, EndTS: 1000, AgentID: "agent-real"})
 	if err != nil {
 		t.Fatalf("RangeQuery() error = %v", err)
 	}
@@ -673,7 +676,7 @@ func TestGetSpanFindsTombstonedSpanWithDeletedSet(t *testing.T) {
 		t.Fatalf("InsertSpan() error = %v", err)
 	}
 
-	got, found, err := wt.GetSpan("trace-x", "span-x")
+	got, found, err := wt.WaitForIngest().GetSpan("trace-x", "span-x")
 	if err != nil {
 		t.Fatalf("GetSpan() error = %v", err)
 	}
