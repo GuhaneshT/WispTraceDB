@@ -50,13 +50,13 @@ type WispTraceConfig struct {
 
 type traceState struct {
 	spans    []wal.SpanPayload
-	lastSeen int64 // unix nanoseconds
+	lastSeen int64 
 }
 
 type WispTrace struct {
 	config WispTraceConfig
 
-	// Core persistent components
+	
 	wal        *wal.WAL
 	index      *pebble.DB
 	checkpoint *Checkpoint
@@ -72,7 +72,7 @@ type WispTrace struct {
 	ingestChan chan wal.SpanPayload
 	ingestWg   sync.WaitGroup
 
-	// Session buffering (accessed by ingestLoop and segmentFlushLoop)
+	// Session buffering 
 	sessionMu        sync.Mutex
 	sessionBuffer    map[string]*traceState
 	sessionSpanCount int
@@ -195,7 +195,7 @@ func (w *WispTrace) loadRollupSnapshots() error {
 		path := rollup.RollupPath(w.config.SegmentDir, win.name)
 		store, err := rollup.ReadSnapshot(path, win.size)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+			if os.IsNotExist(err) {
 				continue // perfectly fine on first boot
 			}
 			return fmt.Errorf("failed to load %s rollup: %w", win.name, err)
@@ -256,11 +256,8 @@ func (w *WispTrace) ingestLoop() {
 	}
 }
 
-// WaitForIngest blocks until all spans submitted to InsertSpan have been fully
-// processed into the in-memory session buffer and rollups. Used primarily in tests.
-func (w *WispTrace) WaitForIngest() *WispTrace {
+func (w *WispTrace) WaitForIngest() {
 	w.ingestWg.Wait()
-	return w
 }
 
 func (w *WispTrace) processSpan(span wal.SpanPayload) {
