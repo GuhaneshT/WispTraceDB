@@ -71,6 +71,7 @@ type WispTrace struct {
 	// Hotpath ingestion
 	ingestChan chan wal.SpanPayload
 	ingestWg   sync.WaitGroup
+	ingestWgMu sync.Mutex // serializes ingestWg.Add against ingestWg.Wait — see WaitForIngest
 
 	// Session buffering 
 	sessionMu        sync.Mutex
@@ -231,8 +232,13 @@ func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
 		return fmt.Errorf("wal append: %w", err)
 	}
 
-	// 2. Offload to background loops for derived state updates
+	// 2. Offload to background loops for derived state updates. ingestWgMu
+	// guards against the sync.WaitGroup "Add concurrently with Wait" misuse:
+	// see WaitForIngest for the other half of this.
+	w.ingestWgMu.Lock()
 	w.ingestWg.Add(1)
+	w.ingestWgMu.Unlock()
+
 	select {
 	case w.ingestChan <- span:
 	case <-w.ctx.Done():
@@ -256,13 +262,32 @@ func (w *WispTrace) ingestLoop() {
 	}
 }
 
-func (w *WispTrace) WaitForIngest() {
+// WaitForIngest blocks until every span enqueued so far has been processed
+// by the background ingest loop, then returns w for chaining (e.g.
+// wt.WaitForIngest().GetSpan(...)).
+//
+// ingestWgMu exists solely to avoid a real sync.WaitGroup misuse: the stdlib
+// docs are explicit that "Add" with a positive delta must not race with
+// "Wait" when the counter could pass through zero in between — a real risk
+// here since InsertSpan can be called concurrently with WaitForIngest.
+// Holding the same mutex around both the Add (in InsertSpan) and this Wait
+// call serializes them, so Add can never execute while a Wait is in
+// progress. Trade-off: a concurrent InsertSpan will block for the duration
+// of an in-progress WaitForIngest call — acceptable since every current
+// caller is a test wanting a deterministic "drain" point, not a production
+// hot path running both concurrently under load.
+func (w *WispTrace) WaitForIngest() *WispTrace {
+	w.ingestWgMu.Lock()
 	w.ingestWg.Wait()
+	w.ingestWgMu.Unlock()
+	return w
 }
 
 func (w *WispTrace) processSpan(span wal.SpanPayload) {
-	// Feed Rollups
-	w.rollups.Add(span.Timestamp, span.Model, int64(span.Cost), int64(span.TokensIn), int64(span.TokensOut), span.LatencyMs)
+	// Feed Rollups. Cost must go through rollup.ScaleCost — span.Cost is a
+	// float64 dollar amount (almost always < $1 for a single LLM span), and
+	// a bare int64(span.Cost) truncates it to zero.
+	w.rollups.Add(span.Timestamp, span.Model, rollup.ScaleCost(span.Cost), int64(span.TokensIn), int64(span.TokensOut), span.LatencyMs)
 
 	// Feed Session Buffer
 	w.sessionMu.Lock()
@@ -370,6 +395,19 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload) error {
 		return fmt.Errorf("save checkpoint at segment %d: %w", result.SegmentID, err)
 	}
 
+	// Snapshot rollups at the same cadence as the checkpoint (PAD1 v1.1),
+	// and — critically — before the WAL segments below are reclaimed. The
+	// independent rollupSnapshotLoop ticker is a periodic backstop, not the
+	// primary guarantee: it can lag behind how fast segments flush, and WAL
+	// pruning is driven by the checkpoint here, not by that ticker. Without
+	// this call, data ingested between two rollup-ticker snapshots but
+	// already checkpointed into a segment would be unrecoverable for
+	// rollups after a crash — recover() only replays the WAL tail, and by
+	// then RemoveSegmentsUpTo would have already deleted it.
+	if err := w.flushRollups(); err != nil {
+		return fmt.Errorf("snapshot rollups at segment %d: %w", result.SegmentID, err)
+	}
+
 	if err := w.wal.RemoveSegmentsUpTo(sealedWALSegment); err != nil {
 		return fmt.Errorf("reclaim wal segments up to %d: %w", sealedWALSegment, err)
 	}
@@ -388,13 +426,20 @@ func (w *WispTrace) rollupSnapshotLoop() {
 		case <-w.ctx.Done():
 			return
 		case <-ticker.C:
-			w.flushRollups()
+			// Backstop only — writeSegmentBatch already snapshots rollups at
+			// the checkpoint-tied point that actually matters for
+			// correctness. Ignore the error here and retry on the next tick.
+			_ = w.flushRollups()
 		}
 	}
 }
 
-func (w *WispTrace) flushRollups() {
-	// Simple eviction: drop anything older than RetentionPeriod
+// flushRollups evicts buckets past RetentionPeriod and snapshots every
+// window's remaining buckets to disk. Returns the first write error
+// encountered (if any) so callers on the correctness-critical path (see
+// writeSegmentBatch) can decide whether to proceed; the periodic background
+// caller (rollupSnapshotLoop) discards it and just retries on the next tick.
+func (w *WispTrace) flushRollups() error {
 	cutoff := time.Now().Add(-w.config.RetentionPeriod).UnixNano()
 
 	w.rollups.Minute.Evict(cutoff)
@@ -403,8 +448,8 @@ func (w *WispTrace) flushRollups() {
 	w.rollups.Day.Evict(cutoff)
 
 	windows := []struct {
-		name string
-		size int64
+		name  string
+		size  int64
 		store *rollup.Store
 	}{
 		{rollup.WindowMinute, rollup.WindowSizeMinute, w.rollups.Minute},
@@ -420,10 +465,12 @@ func (w *WispTrace) flushRollups() {
 			writer.Add(rollup.AggregatedMetrics{BucketKey: key, Value: *val})
 		}
 		if writer.Len() > 0 {
-			// Ignoring error in background loop, will retry on next tick
-			_ = writer.Flush(w.config.SegmentDir, win.name, win.size)
+			if err := writer.Flush(w.config.SegmentDir, win.name, win.size); err != nil {
+				return fmt.Errorf("flush %s rollup snapshot: %w", win.name, err)
+			}
 		}
 	}
+	return nil
 }
 
 func (w *WispTrace) compactionLoop() {
@@ -700,7 +747,9 @@ func (w *WispTrace) Close() error {
 	}
 
 	// 3. Flush final rollup snapshots to disk
-	w.flushRollups()
+	if err := w.flushRollups(); err != nil {
+		errs = append(errs, fmt.Errorf("final rollup snapshot: %w", err))
+	}
 
 	// 4. Close underlying resources
 	if w.wal != nil {

@@ -1,6 +1,9 @@
 package rollup
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 const (
 	WindowMinute  = "1m"
@@ -16,6 +19,28 @@ const (
 	WindowSizeHour    int64 = 60 * 60 * 1_000_000_000
 	WindowSizeDay     int64 = 24 * 60 * 60 * 1_000_000_000
 )
+
+// CostScale converts a float64 dollar amount to the fixed-point int64 units
+// SumCost is stored in (micro-dollars). SumCost stays an integer rather than
+// a float so that millions of incremental additions across a bucket's
+// lifetime don't accumulate floating-point rounding drift — the same reason
+// money is conventionally counted in a small integer subunit instead of a
+// float. Callers must scale on the way in (ScaleCost) and back on the way
+// out (UnscaleCost); never pass a raw float64 dollar amount through int64()
+// directly — that truncates any cost under $1.00 to zero.
+const CostScale = 1_000_000
+
+// ScaleCost converts a float64 dollar amount into CostScale units for
+// storage in a Value's SumCost.
+func ScaleCost(dollars float64) int64 {
+	return int64(math.Round(dollars * CostScale))
+}
+
+// UnscaleCost converts a SumCost total (in CostScale units) back into a
+// float64 dollar amount for display/query results.
+func UnscaleCost(scaled int64) float64 {
+	return float64(scaled) / CostScale
+}
 
 
 type RollupManager struct {

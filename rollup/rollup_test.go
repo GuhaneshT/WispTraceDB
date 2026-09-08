@@ -5,6 +5,48 @@ import (
 	"testing"
 )
 
+// ─── Cost scaling tests ─────────────────────────────────────────────────────
+
+// TestScaleCostPreservesSubDollarAmounts is the regression test for the bug
+// where int64(span.Cost) truncated any cost under $1.00 to zero — the
+// common case for a single LLM span.
+func TestScaleCostPreservesSubDollarAmounts(t *testing.T) {
+	cases := []float64{0.002, 0.05, 0.0001, 1.5, 0}
+	for _, dollars := range cases {
+		scaled := ScaleCost(dollars)
+		if dollars > 0 && scaled == 0 {
+			t.Fatalf("ScaleCost(%v) = 0, want > 0 (this is the truncation-to-zero bug)", dollars)
+		}
+		got := UnscaleCost(scaled)
+		if diff := got - dollars; diff > 1e-9 || diff < -1e-9 {
+			t.Fatalf("UnscaleCost(ScaleCost(%v)) = %v, want %v (within float rounding)", dollars, got, dollars)
+		}
+	}
+}
+
+// TestManagerAccumulatesScaledCostCorrectly proves the actual end-to-end
+// path: adding several sub-dollar costs through the manager and reading the
+// bucket back must reflect their real sum, not zero.
+func TestManagerAccumulatesScaledCostCorrectly(t *testing.T) {
+	mgr := NewRollupManager()
+	ts := int64(10 * 1_000_000_000)
+
+	costs := []float64{0.002, 0.003, 0.001} // sums to 0.006
+	for _, c := range costs {
+		mgr.Add(ts, "gpt-4o", ScaleCost(c), 0, 0, 0)
+	}
+
+	bucket, ok := mgr.GetBucket(WindowMinute, BucketKey{WindowStart: 0, Model: "gpt-4o"})
+	if !ok {
+		t.Fatal("GetBucket() not found")
+	}
+	gotDollars := UnscaleCost(bucket.SumCost)
+	wantDollars := 0.006
+	if diff := gotDollars - wantDollars; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("SumCost as dollars = %v, want %v", gotDollars, wantDollars)
+	}
+}
+
 // ─── RollupManager tests ────────────────────────────────────────────────────
 
 // TestManagerRoutesToAllWindows verifies that a single Add call lands in all
