@@ -83,6 +83,13 @@ func (w *Writer) Flush(dir string, segmentID uint64) (*WriteResult, error) {
 	}
 
 	path := SegmentPath(dir, segmentID)
+	// Segment ids are never reused (append-only, monotonic). Since this open
+	// would O_TRUNC, refuse loudly rather than silently destroying a live
+	// segment that a stale allocator (e.g. a checkpoint seeded from the flush
+	// path alone, missing compaction-created ids) could point at.
+	if _, err := os.Stat(path); err == nil {
+		return nil, fmt.Errorf("segment %d already exists at %s; refusing to overwrite", segmentID, path)
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("create segment file: %w", err)

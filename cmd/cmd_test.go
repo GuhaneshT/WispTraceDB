@@ -727,3 +727,115 @@ func TestPointLookupThroughSegmentReader(t *testing.T) {
 		t.Fatalf("ReadAt() = %+v, want %+v", got, want)
 	}
 }
+
+func TestSegmentIDsSurviveRestartAfterCompaction(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 3 // drive flushes explicitly, not at threshold
+	cfg.CompactionSegmentThreshold = 2
+
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+
+	// Four 2-span batches: segments 1..4 (checkpoint 4), then the inline
+	// compaction after segment 4 merges [1,2] into segment 5, leaving the
+	// manifest as [3,4,5]. Compaction consumed id 5 purely in memory — it is
+	// never written to the checkpoint, which is what the restart below tests.
+	batches := [][]wal.SpanPayload{
+		{testSpan("t-old", "a1", 100), testSpan("t-old", "a2", 101)},
+		{testSpan("t-old", "b1", 110), testSpan("t-old", "b2", 111)},
+		{testSpan("t-old", "c1", 120), testSpan("t-old", "c2", 121)},
+		{testSpan("t-old", "d1", 130), testSpan("t-old", "d2", 131)},
+	}
+	for _, batch := range batches {
+		for _, s := range batch {
+			if err := wt.InsertSpan(s); err != nil {
+				t.Fatalf("InsertSpan() error = %v", err)
+			}
+		}
+		wt.WaitForIngest()
+		if err := wt.Flush(); err != nil {
+			t.Fatalf("Flush() error = %v", err)
+		}
+	}
+
+	if wt.nextSegmentID != 6 {
+		t.Fatalf("nextSegmentID = %d, want 6 (segs 1-4 flushed, [1,2] merged into 5)", wt.nextSegmentID)
+	}
+	live, err := wt.LiveSegments()
+	if err != nil {
+		t.Fatalf("LiveSegments() error = %v", err)
+	}
+	if fmt.Sprint(live) != "[3 4 5]" {
+		t.Fatalf("LiveSegments() = %v, want [3 4 5]", live)
+	}
+
+	if err := wt.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	// ----- restart boundary -----
+	// The checkpoint reads 4, but merged segment 5 is live on disk and in the
+	// manifest. Seeding the next id from the checkpoint alone would hand out 5
+	// again and O_TRUNC the merged segment (now a loud refusal).
+	wt2, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("reopen: CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt2.Close()
+
+	if wt2.nextSegmentID != 6 {
+		t.Fatalf("after restart nextSegmentID = %d, want 6", wt2.nextSegmentID)
+	}
+
+	for _, s := range []wal.SpanPayload{
+		testSpan("t-new", "n1", 200),
+		testSpan("t-new", "n2", 201),
+	} {
+		if err := wt2.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan() error = %v", err)
+		}
+	}
+	wt2.WaitForIngest()
+	if err := wt2.Flush(); err != nil {
+		t.Fatalf("Flush() after restart error = %v", err)
+	}
+
+	// Old spans living in merged segment 5 must survive untouched.
+	got, found, err := wt2.GetSpan("t-old", "a1")
+	if err != nil {
+		t.Fatalf("GetSpan(t-old/a1) error = %v", err)
+	}
+	if !found || got.SpanID != "a1" || got.Timestamp != 100 {
+		t.Fatalf("GetSpan(t-old/a1) = (%+v, %v), want original a1", got, found)
+	}
+
+	// Direct proof the merged file itself was never truncated.
+	reader, err := segment.OpenReader(segment.SegmentPath(cfg.SegmentDir, 5))
+	if err != nil {
+		t.Fatalf("OpenReader(segment 5) error = %v", err)
+	}
+	scanned, scanErr := reader.ScanAll()
+	reader.Close()
+	if scanErr != nil {
+		t.Fatalf("ScanAll(segment 5) error = %v", scanErr)
+	}
+	spanIDs := make(map[string]bool)
+	for _, s := range scanned {
+		spanIDs[s.Span.SpanID] = true
+	}
+	for _, id := range []string{"a1", "a2", "b1", "b2"} {
+		if !spanIDs[id] {
+			t.Fatalf("segment 5 lost span %s after restart: got %v", id, spanIDs)
+		}
+	}
+
+	got2, found2, err := wt2.GetSpan("t-new", "n1")
+	if err != nil {
+		t.Fatalf("GetSpan(t-new/n1) error = %v", err)
+	}
+	if !found2 || got2.SpanID != "n1" {
+		t.Fatalf("GetSpan(t-new/n1) = (%+v, %v), want n1 found", got2, found2)
+	}
+}

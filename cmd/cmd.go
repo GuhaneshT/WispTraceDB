@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -155,8 +157,19 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 		cancel:        cancel,
 		ingestChan:    make(chan wal.SpanPayload, 10000), // Buffer for bursty ingest
 		sessionBuffer: make(map[string]*traceState),
-		nextSegmentID: lastConfirmedSegment + 1,
 	}
+
+	// Segment IDs are seeded from on-disk truth, not the checkpoint alone:
+	// compaction consumes IDs purely in memory (see maybeCompactLocked) and
+	// never persists them to the checkpoint, so after restart the checkpoint
+	// under-allocates and would collide with a live merged segment. See
+	// computeNextSegmentID.
+	nextSegmentID, err := computeNextSegmentID(config.SegmentDir, wt.manifest, lastConfirmedSegment)
+	if err != nil {
+		wt.Close()
+		return nil, fmt.Errorf("compute next segment id: %w", err)
+	}
+	wt.nextSegmentID = nextSegmentID
 
 	// 1. Load Rollup Snapshots
 	if err := wt.loadRollupSnapshots(); err != nil {
@@ -178,6 +191,56 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 	go wt.compactionLoop()
 
 	return wt, nil
+}
+
+// computeNextSegmentID returns one past the highest segment id ever seen, so
+// the next new segment is guaranteed free: max(lastConfirmed, manifest live
+// ids, on-disk segment_%06d.seg ids) + 1.
+//
+// The checkpoint alone under-allocates here: Checkpoint.Save is only called
+// by writeSegmentBatch, while maybeCompactLocked carves out merged-segment ids
+// from nextSegmentID purely in memory and never persists them. Those ids do
+// land in the manifest and as segment files, so after a restart the next flush
+// could otherwise O_TRUNC a live merged segment (writer.Flush explicitly
+// refuses to overwrite, so this is now a loud error rather than corruption).
+//
+// A corrupt/unreadable manifest is treated as empty on purpose: the manifest
+// is derived state and the directory scan is authoritative for id allocation
+// regardless (see segment.Manifest doc).
+func computeNextSegmentID(segDir string, manifest *segment.Manifest, lastConfirmed uint64) (uint64, error) {
+	maxID := lastConfirmed
+
+	live, err := manifest.Load()
+	if err == nil {
+		for _, id := range live {
+			if id > maxID {
+				maxID = id
+			}
+		}
+	}
+
+	entries, err := os.ReadDir(segDir)
+	if err != nil {
+		return 0, fmt.Errorf("scan segment dir: %w", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "segment_") || !strings.HasSuffix(name, ".seg") {
+			continue
+		}
+		// rollup snapshots and *.tmp files in the same dir never match this
+		// strict pattern, so they can't be misread as segment ids.
+		digits := strings.TrimSuffix(strings.TrimPrefix(name, "segment_"), ".seg")
+		id, perr := strconv.ParseUint(digits, 10, 64)
+		if perr != nil {
+			continue
+		}
+		if id > maxID {
+			maxID = id
+		}
+	}
+
+	return maxID + 1, nil
 }
 
 func (w *WispTrace) loadRollupSnapshots() error {
