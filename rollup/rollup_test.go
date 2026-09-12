@@ -36,7 +36,7 @@ func TestManagerAccumulatesScaledCostCorrectly(t *testing.T) {
 		mgr.Add(ts, "gpt-4o", ScaleCost(c), 0, 0, 0)
 	}
 
-	bucket, ok := mgr.GetBucket(WindowMinute, BucketKey{WindowStart: 0, Model: "gpt-4o"})
+	bucket, ok,_ := mgr.GetBucket(WindowMinute, BucketKey{WindowStart: 0, Model: "gpt-4o"})
 	if !ok {
 		t.Fatal("GetBucket() not found")
 	}

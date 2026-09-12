@@ -196,7 +196,7 @@ func (w *WispTrace) loadRollupSnapshots() error {
 		path := rollup.RollupPath(w.config.SegmentDir, win.name)
 		store, err := rollup.ReadSnapshot(path, win.size)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if errors.Is(err, os.ErrNotExist) {
 				continue // perfectly fine on first boot
 			}
 			return fmt.Errorf("failed to load %s rollup: %w", win.name, err)
