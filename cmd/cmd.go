@@ -413,6 +413,15 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload) error {
 	}
 
 	w.nextSegmentID++
+
+	// Trigger compaction inline (we already hold flushMu here) rather than
+	// waiting for the separate background ticker: keeping live segment count
+	// tight keeps range queries fast instead of letting files pile up for up
+	// to CompactionSegmentThreshold flushes. Expiry deliberately stays on the
+	// background ticker — it is the one maintenance task whose destructive
+	// work has no place on the ingest flush path.
+	w.maybeCompactLocked()
+
 	return nil
 }
 
@@ -492,7 +501,15 @@ func (w *WispTrace) compactionLoop() {
 func (w *WispTrace) maybeCompact() {
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
+	w.maybeCompactLocked()
+}
 
+// maybeCompactLocked merges the oldest half of the live segments into one
+// new segment once the live count exceeds CompactionSegmentThreshold. The
+// caller must already hold flushMu (either writeSegmentBatch or the
+// compaction loop) so segment ids and the manifest can't be mutated
+// concurrently.
+func (w *WispTrace) maybeCompactLocked() {
 	live, err := w.manifest.Load()
 	if err != nil || len(live) <= w.config.CompactionSegmentThreshold {
 		return
@@ -514,12 +531,17 @@ func (w *WispTrace) maybeCompact() {
 func (w *WispTrace) maybeExpire() {
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
+	w.maybeExpireLocked()
+}
 
+// maybeExpireLocked drops segments whose zone-map MaxTimestamp is past the
+// retention cutoff. The caller must already hold flushMu.
+func (w *WispTrace) maybeExpireLocked() {
 	live, err := w.manifest.Load()
 	if err != nil || len(live) == 0 {
 		return
 	}
-	
+
 	cutoff := time.Now().Add(-w.config.RetentionPeriod).UnixNano()
 	_, _ = w.Compactor().Expire(live, cutoff)
 }
@@ -726,6 +748,11 @@ func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 }
 
 func (w *WispTrace) Flush() error {
+	// Drain the ingest pipeline first: spans acked by InsertSpan are queued
+	// to a background goroutine, and flushAllSessions only sees spans already
+	// moved into the session buffer. Without this the flush could run while a
+	// just-acked span is still in flight and silently miss it.
+	w.WaitForIngest()
 	return w.flushAllSessions()
 }
 

@@ -702,6 +702,11 @@ func TestPointLookupThroughSegmentReader(t *testing.T) {
 		t.Fatalf("InsertSpan() error = %v", err)
 	}
 
+	// Ensure the span is flushed and indexed before the raw index read: the
+	// index is written by the background ingest goroutine, and without a sync
+	// point this races it.
+	wt.WaitForIngest()
+
 	key := segment.CompositeKey(want.TraceID, want.SpanID)
 	loc, err := wt.index.GetSpan([]byte(key))
 	if err != nil {
