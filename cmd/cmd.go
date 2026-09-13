@@ -83,6 +83,27 @@ type WispTrace struct {
 	// segment writer state
 	flushMu       sync.Mutex
 	nextSegmentID uint64
+
+	// recovering forces processSpan to skip its inline threshold flush (and
+	// maybeCompactLocked to skip compaction) while a crash-recovery replay is
+	// in flight. Recovery must drain the whole WAL tail into a single final
+	// segment and must not reclaim any WAL segment along the way: a crash
+	// inside a recovery that already reclaimed a rotated segment would make
+	// the un-reclaimed part of the tail permanently lost, even though the
+	// spans were acknowledged.
+	recovering bool
+
+	// walReclaimBelow is the id of the oldest sealed WAL segment that must be
+	// kept on disk: it is the segment that was CURRENT when the previous
+	// flush snapshotted its drain, so it may still hold records that
+	// InsertSpan has already appended and fsynced (an ack returns
+	// synchronously after the WAL write) but that the async ingest loop has
+	// not yet drained. Reclaiming it now would lose acknowledged spans on the
+	// very next crash. Only segments STRICTLY below it are reclaimed; every
+	// record below was enqueued before that drain's snapshot and, being part
+	// of the FIFO processed prefix, was provably sealed into the previous
+	// flush's checkpointed segment. See writeSegmentBatch.
+	walReclaimBelow uint64
 }
 
 func CreateWisp() (*WispTrace, error) {
@@ -274,19 +295,120 @@ func (w *WispTrace) recover() error {
 	if err != nil {
 		return fmt.Errorf("replay wal: %w", err)
 	}
-	if len(records) == 0 {
-		return nil
-	}
 
+	// Recovery is a two-phase drain: replay every tail record into the session
+	// buffer, then flush everything once. Inline threshold flushes during the
+	// replay are disabled (recovering=true) so no WAL segment is rotated or
+	// reclaimed until the whole replay is in memory; an inline flush that
+	// reclaimed the rotated tail would lose the remaining replayed spans if
+	// this recovery itself crashed partway.
+	w.recovering = true
 	for _, record := range records {
+		// A crash inside writeSegmentBatch can leave spans already durable
+		// and indexed (segment + index batch committed) while their WAL
+		// records are still present (not reclaimed past the checkpoint).
+		// Re-processing them would duplicate the data across two segments, so
+		// any span the index already resolves to a readable matching record
+		// is skipped as already confirmed.
+		if w.spanAlreadyIndexed(record.Span) {
+			continue
+		}
 		w.processSpan(record.Span)
 	}
+	w.recovering = false
 
-	// Flush whatever was recovered immediately before booting
-	if err := w.flushAllSessions(); err != nil {
-		return fmt.Errorf("flush recovered spans: %w", err)
+	if len(records) > 0 {
+		// Flush whatever was recovered immediately before booting
+		if err := w.flushAllSessions(); err != nil {
+			return fmt.Errorf("flush recovered spans: %w", err)
+		}
+	}
+
+	// Manifest is derived state. Rebuild it from the index — the newest
+	// committed pointer set — so a crash mid-compaction (index batch applied,
+	// manifest swap not yet) resolves to the same single live set the index
+	// describes, instead of resurrecting superseded segments.
+	if err := w.reconcileManifest(); err != nil {
+		return fmt.Errorf("reconcile manifest: %w", err)
 	}
 	return nil
+}
+
+// spanAlreadyIndexed reports whether the index already holds one entry for
+// span that resolves, via a readable segment file, back to a record with the
+// same composite key. If so the span is confirmed: it was checkpointed past
+// and replaying it again would duplicate it.
+func (w *WispTrace) spanAlreadyIndexed(span wal.SpanPayload) bool {
+	key := segment.CompositeKey(span.TraceID, span.SpanID)
+	loc, err := w.index.GetSpan([]byte(key))
+	if err != nil {
+		return false
+	}
+
+	reader, err := segment.OpenReader(segment.SegmentPath(w.config.SegmentDir, loc.SegmentID))
+	if err != nil {
+		return false
+	}
+	got, err := reader.ReadAt(loc.Offset)
+	reader.Close()
+
+	return err == nil && segment.CompositeKey(got.TraceID, got.SpanID) == key
+}
+
+// reconcileManifest rewrites the manifest to be exactly the set of segment
+// ids referenced by the trace index. Segments are immutable and every record
+// in a flush-created segment is indexed at write time, so in the steady state
+// the two sets are identical; a crash between a compactor's index batch and
+// its manifest swap is the one window that splits them. Dropping a segment
+// the index no longer references is safe — its records were either
+// superseded by an index update or reclaimed as tombstones.
+func (w *WispTrace) reconcileManifest() error {
+	indexed, err := w.index.ScanAll()
+	if err != nil {
+		return fmt.Errorf("scan index: %w", err)
+	}
+
+	live := make([]uint64, 0, len(indexed))
+	seen := make(map[uint64]bool, len(indexed))
+	for _, loc := range indexed {
+		if seen[loc.SegmentID] {
+			continue
+		}
+		path := segment.SegmentPath(w.config.SegmentDir, loc.SegmentID)
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("index references segment %d at %s but it is missing: %w", loc.SegmentID, path, err)
+		}
+		seen[loc.SegmentID] = true
+		live = append(live, loc.SegmentID)
+	}
+
+	current, err := w.manifest.Load()
+	if err != nil {
+		return fmt.Errorf("load manifest: %w", err)
+	}
+	if !segmentSetEqual(current, live) {
+		if err := w.manifest.Save(live); err != nil {
+			return fmt.Errorf("save manifest: %w", err)
+		}
+	}
+	return nil
+}
+
+// segmentSetEqual compares two sets of segment ids without regard to order.
+func segmentSetEqual(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[uint64]bool, len(a))
+	for _, id := range a {
+		seen[id] = true
+	}
+	for _, id := range b {
+		if !seen[id] {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
@@ -366,7 +488,7 @@ func (w *WispTrace) processSpan(span wal.SpanPayload) {
 	needsFlush := w.sessionSpanCount >= w.config.SegmentFlushThreshold
 	w.sessionMu.Unlock()
 
-	if needsFlush {
+	if needsFlush && !w.recovering {
 		_ = w.flushAllSessions()
 	}
 }
@@ -393,6 +515,9 @@ func (w *WispTrace) flushExpiredSessions() {
 	var toFlush []wal.SpanPayload
 
 	w.sessionMu.Lock()
+	// Capture the WAL segment active during this drain snapshot: the entry
+	// below writeSegmentBatch uses it to decide what may safely be reclaimed.
+	drainWAL := w.wal.CurrentSegment()
 	for traceID, state := range w.sessionBuffer {
 		if now-state.lastSeen > timeoutNs {
 			toFlush = append(toFlush, state.spans...)
@@ -403,13 +528,16 @@ func (w *WispTrace) flushExpiredSessions() {
 	w.sessionMu.Unlock()
 
 	if len(toFlush) > 0 {
-		_ = w.writeSegmentBatch(toFlush)
+		_ = w.writeSegmentBatch(toFlush, drainWAL)
 	}
 }
 
 func (w *WispTrace) flushAllSessions() error {
 	var toFlush []wal.SpanPayload
 	w.sessionMu.Lock()
+	// Capture the WAL segment active during this drain snapshot: the entry
+	// below writeSegmentBatch uses it to decide what may safely be reclaimed.
+	drainWAL := w.wal.CurrentSegment()
 	for traceID, state := range w.sessionBuffer {
 		toFlush = append(toFlush, state.spans...)
 		delete(w.sessionBuffer, traceID)
@@ -418,16 +546,16 @@ func (w *WispTrace) flushAllSessions() error {
 	w.sessionMu.Unlock()
 
 	if len(toFlush) > 0 {
-		return w.writeSegmentBatch(toFlush)
+		return w.writeSegmentBatch(toFlush, drainWAL)
 	}
 	return nil
 }
 
-func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload) error {
+func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) error {
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
 
-	sealedWALSegment, err := w.wal.Rotate()
+	_, err := w.wal.Rotate()
 	if err != nil {
 		return fmt.Errorf("rotate wal: %w", err)
 	}
@@ -471,9 +599,19 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload) error {
 		return fmt.Errorf("snapshot rollups at segment %d: %w", result.SegmentID, err)
 	}
 
-	if err := w.wal.RemoveSegmentsUpTo(sealedWALSegment); err != nil {
-		return fmt.Errorf("reclaim wal segments up to %d: %w", sealedWALSegment, err)
+	if w.walReclaimBelow > 0 {
+		if err := w.wal.RemoveSegmentsUpTo(w.walReclaimBelow - 1); err != nil {
+			return fmt.Errorf("reclaim wal segments up to %d: %w", w.walReclaimBelow-1, err)
+		}
 	}
+	// The segment active during THIS flush's drain (captured by the caller
+	// as drainWAL, and now sealed by the Rotate above) stays on disk: it can
+	// still hold spans that were already appended and acknowledged while the
+	// ingest loop was busy draining/flushing, and deleting them would lose
+	// acknowledged spans on the very next crash. The next flush proves every
+	// record below it was part of this drain's FIFO processed prefix and
+	// reclaims them then.
+	w.walReclaimBelow = drainWAL
 
 	w.nextSegmentID++
 
@@ -587,6 +725,12 @@ func (w *WispTrace) maybeCompactLocked() {
 
 	newSegmentID := w.nextSegmentID
 	w.nextSegmentID++
+
+	if w.recovering {
+		// Recovery holds all replayed spans in memory behind a single final
+		// flush, so there is nothing compacted yet to compact.
+		return
+	}
 
 	_, _ = w.Compactor().Compact(toMerge, newSegmentID)
 }

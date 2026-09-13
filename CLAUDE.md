@@ -71,7 +71,7 @@ Implementation follows a strict, sequenced order because durability and crash-co
 
 **tests/wal_test.go:**
 - Rotation, reopen, checksum mismatch, torn tail, legacy adoption, tombstone round-trip all covered.
-- Fault-injection harness (kill -9 under concurrent load): not yet implemented, but architecture is ready for it.
+- **Fault-injection harness (`tests/fault_injection_test.go`, PAD1 §3 / PDD1 §7):** a self-execed worker process ingest-loads while the driver force-kills it (`Process.Kill()`, the Go equivalent of kill -9 / TerminateProcess), then reopens and asserts — every acked span survives byte-identical, `CheckConsistency()` passes, nothing is duplicated, nothing phantom appears. Ack durability is verified via an on-disk oracle file outside the db dir.
 
 ### Phase 2 — In Progress
 
@@ -81,11 +81,19 @@ Implementation follows a strict, sequenced order because durability and crash-co
   - `PutSpan(key, location)`: write a span location to the index (key = trace_id || span_id).
   - `GetSpan(key)`: point lookup, returns `ErrNotFound` if absent or deleted.
   - `PrefixScan(prefix)`: all spans of a trace (prefix = trace_id ||), used for full-trace reconstruction.
+  - `ScanAll()`: every (key → location) in the index (diagnostic path, no bounds) — feeds `cmd.CheckConsistency` and startup manifest reconciliation.
   - `DeleteSpan(key)`: remove from index (tombstone effect).
   - `encodeSpanLocation` / `decodeSpanLocation`: fixed-width (16-byte) value serialization.
 
 **pebble/pebble_test.go:**
-- Put/get, not found, prefix scan, delete, encode/decode, multiple traces all covered.
+- Put/get, not found, prefix scan, delete, encode/decode, multiple traces, ScanAll all covered.
+
+**cmd/consistency.go:**
+- `CheckConsistency()` → `ConsistencyReport{Errors, Warnings}`: manifest↔file and index↔segment cross-checks both directions, record-CRC pass, checkpoint-bound sanity, orphan-file reporting. Harness gate + operator diagnostic.
+
+**Recovery/reconciliation (crash windows made provably benign):**
+- `computeNextSegmentID()` seeds the id allocator from `max(checkpoint, manifest, on-disk segment files) + 1` — compaction-created ids were in-memory only, and re-seeding from the checkpoint alone could O_TRUNC a live merged segment after restart. `segment.Writer.Flush` additionally refuses to overwrite an existing segment file.
+- `recover()` skips spans the index already resolves to a readable matching record (a crash inside `writeSegmentBatch` otherwise re-flushes confirmed spans and duplicates data), and reconciles the manifest to the index-referenced segment set (a crash between a compactor's index batch and its manifest swap otherwise resurrects superseded segments).
 
 **Next for Phase 2:**
 - Segment writer (columnar file format with zone map and bloom filters).
@@ -130,6 +138,12 @@ go test ./... -v
 # Run a specific test
 go test ./wal -run TestWALTombstoneRoundTripsAsAuthoritativeDelete -v
 
+# Run the fault-injection kill -9 harness (use -short for a quick pass)
+go test ./tests -run FaultInjection -v
+
+# Run just the consistency checker tests
+go test ./cmd -run CheckConsistency -v
+
 # Check for issues
 go vet ./...
 
@@ -152,10 +166,15 @@ segment/
   (Phase 2)       — columnar segment file format, zone maps, bloom filters
 
 cmd/
-  cmd.go          — placeholder entry point, will hold WispTrace engine wiring
+  cmd.go          — WispTrace engine wiring: ingestion, session buffering,
+                    segment flush, compaction, query APIs
+  consistency.go  — CheckConsistency: index↔segment↔manifest cross-checks
+  checkpoint.go   — durable segment watermark
 
 tests/
   wal_test.go     — WAL tests (can also live in wal/ as wal_test.go)
+  fault_injection_test.go — kill -9 harness: self-execed crashable worker,
+                    ack oracle, force-kill driver, post-crash assertions
 
 docs/
   PAD1.md         — frozen v1.2 architecture doc (non-negotiable)

@@ -119,6 +119,35 @@ func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 
 
 
+// ScanAll returns every (key -> SpanLocation) currently in the index, keyed
+// by the raw trace_id||span_id composite key. Used by cmd.CheckConsistency to
+// cross-reference the index against segment files. Unlike PrefixScan this
+// iterates the entire key space (no bounds), so it is a diagnostic/startup
+// path, not a query path.
+func (d *DB) ScanAll() (map[string]SpanLocation, error) {
+	if d.db == nil {
+		return nil, fmt.Errorf("pebble db is closed")
+	}
+	iter, err := d.db.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("new index iterator: %w", err)
+	}
+	defer iter.Close()
+
+	all := make(map[string]SpanLocation)
+	for iter.First(); iter.Valid(); iter.Next() {
+		location, err := decodeSpanLocation(iter.Value())
+		if err != nil {
+			return nil, fmt.Errorf("decode span location at key %s: %w", string(iter.Key()), err)
+		}
+		all[string(iter.Key())] = location
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("index iterator: %w", err)
+	}
+	return all, nil
+}
+
 // DeleteSpan removes a span from the trace index (tombstone effect).
 // Used during retention-driven expiry when a segment is dropped.
 func (d *DB) DeleteSpan(key []byte) error {

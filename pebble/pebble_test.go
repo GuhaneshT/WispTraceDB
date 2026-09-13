@@ -42,6 +42,43 @@ func TestGetSpanNotFound(t *testing.T) {
 	}
 }
 
+func TestScanAllReturnsEveryEntryWithItsKey(t *testing.T) {
+	db, err := OpenDB(filepath.Join(t.TempDir(), "test_lsm"))
+	if err != nil {
+		t.Fatalf("OpenDB() error = %v", err)
+	}
+	defer db.Close()
+
+	want := map[string]SpanLocation{
+		"trace-a||span-1": {SegmentID: 1, Offset: 0},
+		"trace-a||span-2": {SegmentID: 1, Offset: 128},
+		"trace-b||span-1": {SegmentID: 2, Offset: 512},
+		"trace-c||span-9": {SegmentID: 3, Offset: 24},
+	}
+	for key, loc := range want {
+		if err := db.PutSpan([]byte(key), loc); err != nil {
+			t.Fatalf("PutSpan(%s) error = %v", key, err)
+		}
+	}
+
+	got, err := db.ScanAll()
+	if err != nil {
+		t.Fatalf("ScanAll() error = %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ScanAll() returned %d entries, want %d: %v", len(got), len(want), got)
+	}
+	for key, loc := range want {
+		gotLoc, ok := got[key]
+		if !ok {
+			t.Fatalf("ScanAll() missing key %q", key)
+		}
+		if gotLoc != loc {
+			t.Fatalf("ScanAll()[%q] = %+v, want %+v", key, gotLoc, loc)
+		}
+	}
+}
+
 func TestPrefixScanReturnsAllSpansInTrace(t *testing.T) {
 	db, err := OpenDB(filepath.Join(t.TempDir(), "test_lsm"))
 	if err != nil {
