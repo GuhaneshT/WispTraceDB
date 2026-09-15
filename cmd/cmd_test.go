@@ -1050,17 +1050,17 @@ func TestTier3AndTier4QueryAPIs(t *testing.T) {
 	}
 
 	// 6. Distinct Dimensions
-	models, err := wt.GetDistinctModels(90, 150)
+	models, err := wt.GetDistinctModels(90, 150, 0)
 	if err != nil || len(models) != 2 || models[0] != "claude-3-5-sonnet" || models[1] != "gpt-4o" {
 		t.Fatalf("GetDistinctModels() = %v, err = %v", models, err)
 	}
 
-	teams, err := wt.GetDistinctTeams(90, 150)
+	teams, err := wt.GetDistinctTeams(90, 150, 0)
 	if err != nil || len(teams) != 2 || teams[0] != "team-a" || teams[1] != "team-b" {
 		t.Fatalf("GetDistinctTeams() = %v, err = %v", teams, err)
 	}
 
-	agents, err := wt.GetDistinctAgents(90, 150)
+	agents, err := wt.GetDistinctAgents(90, 150, 0)
 	if err != nil || len(agents) != 2 || agents[0] != "agent-1" || agents[1] != "agent-2" {
 		t.Fatalf("GetDistinctAgents() = %v, err = %v", agents, err)
 	}

@@ -34,6 +34,10 @@ const (
 	defaultCompactionInterval         = 10 * time.Minute
 	defaultRetentionPeriod            = 7 * 24 * time.Hour
 	defaultSessionTimeout             = 5 * time.Second
+
+	// MaxCardinalityPerQuery is the hard limit on distinct values returned by cardinality queries
+	// (GetDistinctModels, GetDistinctTeams, GetDistinctAgents) to prevent OOM errors.
+	MaxCardinalityPerQuery = 10000
 )
 
 type WispTraceConfig struct {
@@ -1208,7 +1212,8 @@ func (w *WispTrace) GetErrorRate(model string, startTS, endTS int64) (float64, e
 }
 
 // GetDistinctModels returns a sorted list of unique model names seen within [startTS, endTS].
-func (w *WispTrace) GetDistinctModels(startTS, endTS int64) ([]string, error) {
+// limit: maximum number of results to return (0 = no limit, but hard-capped at MaxCardinalityPerQuery for safety).
+func (w *WispTrace) GetDistinctModels(startTS, endTS int64, limit int) ([]string, error) {
 	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
 	if err != nil {
 		return nil, err
@@ -1219,14 +1224,22 @@ func (w *WispTrace) GetDistinctModels(startTS, endTS int64) ([]string, error) {
 		if s.Model != "" && !seen[s.Model] {
 			seen[s.Model] = true
 			models = append(models, s.Model)
+			// Stop early if cardinality safety limit reached
+			if len(models) >= MaxCardinalityPerQuery {
+				return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct models (limit: %d)", len(models), MaxCardinalityPerQuery)
+			}
 		}
 	}
 	sort.Strings(models)
+	if limit > 0 && len(models) > limit {
+		models = models[:limit]
+	}
 	return models, nil
 }
 
 // GetDistinctTeams returns a sorted list of unique team names seen within [startTS, endTS].
-func (w *WispTrace) GetDistinctTeams(startTS, endTS int64) ([]string, error) {
+// limit: maximum number of results to return (0 = no limit, but hard-capped at MaxCardinalityPerQuery for safety).
+func (w *WispTrace) GetDistinctTeams(startTS, endTS int64, limit int) ([]string, error) {
 	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
 	if err != nil {
 		return nil, err
@@ -1237,14 +1250,22 @@ func (w *WispTrace) GetDistinctTeams(startTS, endTS int64) ([]string, error) {
 		if s.Team != "" && !seen[s.Team] {
 			seen[s.Team] = true
 			teams = append(teams, s.Team)
+			// Stop early if cardinality safety limit reached
+			if len(teams) >= MaxCardinalityPerQuery {
+				return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct teams (limit: %d)", len(teams), MaxCardinalityPerQuery)
+			}
 		}
 	}
 	sort.Strings(teams)
+	if limit > 0 && len(teams) > limit {
+		teams = teams[:limit]
+	}
 	return teams, nil
 }
 
 // GetDistinctAgents returns a sorted list of unique agent IDs seen within [startTS, endTS].
-func (w *WispTrace) GetDistinctAgents(startTS, endTS int64) ([]string, error) {
+// limit: maximum number of results to return (0 = no limit, but hard-capped at MaxCardinalityPerQuery for safety).
+func (w *WispTrace) GetDistinctAgents(startTS, endTS int64, limit int) ([]string, error) {
 	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
 	if err != nil {
 		return nil, err
@@ -1255,9 +1276,16 @@ func (w *WispTrace) GetDistinctAgents(startTS, endTS int64) ([]string, error) {
 		if s.AgentID != "" && !seen[s.AgentID] {
 			seen[s.AgentID] = true
 			agents = append(agents, s.AgentID)
+			// Stop early if cardinality safety limit reached
+			if len(agents) >= MaxCardinalityPerQuery {
+				return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct agents (limit: %d)", len(agents), MaxCardinalityPerQuery)
+			}
 		}
 	}
 	sort.Strings(agents)
+	if limit > 0 && len(agents) > limit {
+		agents = agents[:limit]
+	}
 	return agents, nil
 }
 
