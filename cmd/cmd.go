@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -335,9 +336,10 @@ func (w *WispTrace) recover() error {
 }
 
 // spanAlreadyIndexed reports whether the index already holds one entry for
-// span that resolves, via a readable segment file, back to a record with the
-// same composite key. If so the span is confirmed: it was checkpointed past
-// and replaying it again would duplicate it.
+// span that resolves, via a readable segment file, back to an exact matching
+// record (same write, including Deleted flag, timestamp, and payload). If so
+// the span is confirmed: it was checkpointed past and replaying it again would
+// duplicate it.
 func (w *WispTrace) spanAlreadyIndexed(span wal.SpanPayload) bool {
 	key := segment.CompositeKey(span.TraceID, span.SpanID)
 	loc, err := w.index.GetSpan([]byte(key))
@@ -352,7 +354,25 @@ func (w *WispTrace) spanAlreadyIndexed(span wal.SpanPayload) bool {
 	got, err := reader.ReadAt(loc.Offset)
 	reader.Close()
 
-	return err == nil && segment.CompositeKey(got.TraceID, got.SpanID) == key
+	return err == nil && spansEqual(got, span)
+}
+
+func spansEqual(a, b wal.SpanPayload) bool {
+	return a.TraceID == b.TraceID &&
+		a.SpanID == b.SpanID &&
+		a.ParentSpanID == b.ParentSpanID &&
+		a.Timestamp == b.Timestamp &&
+		a.AgentID == b.AgentID &&
+		a.Model == b.Model &&
+		a.ToolName == b.ToolName &&
+		a.Team == b.Team &&
+		a.Status == b.Status &&
+		a.TokensIn == b.TokensIn &&
+		a.TokensOut == b.TokensOut &&
+		a.Cost == b.Cost &&
+		a.LatencyMs == b.LatencyMs &&
+		a.Deleted == b.Deleted &&
+		bytes.Equal(a.Payload, b.Payload)
 }
 
 // reconcileManifest rewrites the manifest to be exactly the set of segment
@@ -1000,6 +1020,32 @@ func (w *WispTrace) Close() error {
 
 	if len(errs) > 0 {
 		return fmt.Errorf("wisptrace close errors: %v", errs)
+	}
+	return nil
+}
+
+// CloseWithoutFlush stops background loops and closes underlying storage handles
+// without flushing in-memory session buffer spans to segments, simulating a crash.
+func (w *WispTrace) CloseWithoutFlush() error {
+	var errs []error
+
+	w.cancel()
+	w.bgWg.Wait()
+
+	if w.wal != nil {
+		if err := w.wal.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("wal close: %w", err))
+		}
+	}
+
+	if w.index != nil {
+		if err := w.index.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("index close: %w", err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("wisptrace close without flush errors: %v", errs)
 	}
 	return nil
 }

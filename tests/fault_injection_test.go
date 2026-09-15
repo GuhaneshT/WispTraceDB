@@ -477,3 +477,63 @@ func dumpDiskState(t *testing.T, cfg cmd.WispTraceConfig) {
 		t.Logf("  %s: %d records -> %v", name, len(seqs), seqs)
 	}
 }
+
+// TestFaultInjectionInsertFlushDeleteCrash tests crash recovery durability when
+// an acknowledged delete for an already-flushed span key is present in the WAL tail.
+func TestFaultInjectionInsertFlushDeleteCrash(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "db")
+	cfg := faultTestConfig(dbDir)
+
+	// Step 1: Open engine, insert span, and flush to segment + index.
+	wt, err := cmd.CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("create engine: %v", err)
+	}
+
+	span := wal.SpanPayload{
+		TraceID:   "t-fault-reuse",
+		SpanID:    "s-fault-reuse-1",
+		Timestamp: time.Now().UnixNano(),
+		AgentID:   "agent-f",
+		Model:     "model-f",
+		Payload:   []byte("live-payload"),
+		Deleted:   false,
+	}
+
+	if err := wt.InsertSpan(span); err != nil {
+		t.Fatalf("InsertSpan: %v", err)
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// Step 2: Delete the same span key (append Deleted=true to WAL).
+	deleteSpan := span
+	deleteSpan.Deleted = true
+	if err := wt.InsertSpan(deleteSpan); err != nil {
+		t.Fatalf("InsertSpan(delete): %v", err)
+	}
+	wt.WaitForIngest()
+
+	// Step 3: Crash before the next segment flush (CloseWithoutFlush).
+	if err := wt.CloseWithoutFlush(); err != nil {
+		t.Fatalf("CloseWithoutFlush: %v", err)
+	}
+
+	// Step 4: Reopen engine, triggering crash recovery.
+	wt2, err := cmd.CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	defer wt2.Close()
+
+	// Step 5: Assert that post-recovery, the span is NOT resurrected as a live span.
+	got, found, err := wt2.GetSpan("t-fault-reuse", "s-fault-reuse-1")
+	if err != nil {
+		t.Fatalf("GetSpan after recovery error = %v", err)
+	}
+	if found && !got.Deleted {
+		t.Fatalf("span resurrected after crash recovery: got %+v, want deleted", got)
+	}
+}

@@ -839,3 +839,50 @@ func TestSegmentIDsSurviveRestartAfterCompaction(t *testing.T) {
 		t.Fatalf("GetSpan(t-new/n1) = (%+v, %v), want n1 found", got2, found2)
 	}
 }
+
+func TestRecoveryPreservesDeleteAfterFlush(t *testing.T) {
+	cfg := testConfig(t)
+	// Create engine and insert a span, then flush it to segment & index.
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+
+	span := testSpan("t1", "s1", 100)
+	if err := wt.InsertSpan(span); err != nil {
+		t.Fatalf("InsertSpan() error = %v", err)
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	// Now append a delete record for the same key to WAL, but close without flushing session buffer.
+	deleteSpan := testSpan("t1", "s1", 100)
+	deleteSpan.Deleted = true
+	if err := wt.InsertSpan(deleteSpan); err != nil {
+		t.Fatalf("InsertSpan(delete) error = %v", err)
+	}
+	wt.WaitForIngest()
+
+	// Simulate crash: stop engine background loops without calling wt.Flush().
+	if err := wt.CloseWithoutFlush(); err != nil {
+		t.Fatalf("CloseWithoutFlush() error = %v", err)
+	}
+
+	// Reopen engine — recover() runs and replays the WAL.
+	wt2, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("reopen CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt2.Close()
+
+	// Post-recovery, GetSpan("t1", "s1") must NOT return a live, un-deleted span.
+	got, found, err := wt2.GetSpan("t1", "s1")
+	if err != nil {
+		t.Fatalf("GetSpan(t1, s1) error = %v", err)
+	}
+	if found && !got.Deleted {
+		t.Fatalf("GetSpan(t1, s1) returned live span %+v after crash recovery, want deleted / not resurrected", got)
+	}
+}
