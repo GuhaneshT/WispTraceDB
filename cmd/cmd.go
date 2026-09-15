@@ -974,6 +974,87 @@ func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 	return results, nil
 }
 
+// ListTraces returns a list of distinct trace IDs matching filter, capped at limit.
+// A limit <= 0 returns all matching trace IDs.
+func (w *WispTrace) ListTraces(filter RangeFilter, limit int) ([]string, error) {
+	spans, err := w.RangeQuery(filter)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool)
+	var traceIDs []string
+	for _, s := range spans {
+		if !seen[s.TraceID] {
+			seen[s.TraceID] = true
+			traceIDs = append(traceIDs, s.TraceID)
+			if limit > 0 && len(traceIDs) >= limit {
+				break
+			}
+		}
+	}
+	return traceIDs, nil
+}
+
+// QueryWithCursor returns a paginated slice of matching spans starting from cursor, up to pageSize.
+// It returns the slice of spans and an opaque nextCursor string. An empty nextCursor means no more results.
+func (w *WispTrace) QueryWithCursor(filter RangeFilter, pageSize int, cursor string) ([]wal.SpanPayload, string, error) {
+	spans, err := w.RangeQuery(filter)
+	if err != nil {
+		return nil, "", err
+	}
+
+	offset := 0
+	if cursor != "" {
+		parsed, err := strconv.Atoi(cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid cursor: %w", err)
+		}
+		if parsed > 0 {
+			offset = parsed
+		}
+	}
+
+	if offset >= len(spans) || pageSize <= 0 {
+		return []wal.SpanPayload{}, "", nil
+	}
+
+	end := offset + pageSize
+	nextCursor := ""
+	if end < len(spans) {
+		nextCursor = strconv.Itoa(end)
+	} else {
+		end = len(spans)
+	}
+
+	return spans[offset:end], nextCursor, nil
+}
+
+// QueryByModel returns all live spans matching the given model within [startTS, endTS].
+func (w *WispTrace) QueryByModel(model string, startTS, endTS int64) ([]wal.SpanPayload, error) {
+	return w.RangeQuery(RangeFilter{Model: model, StartTS: startTS, EndTS: endTS})
+}
+
+// QueryByTeam returns all live spans matching the given team within [startTS, endTS].
+func (w *WispTrace) QueryByTeam(team string, startTS, endTS int64) ([]wal.SpanPayload, error) {
+	return w.RangeQuery(RangeFilter{Team: team, StartTS: startTS, EndTS: endTS})
+}
+
+// QueryByStatus returns all live spans matching the given status within [startTS, endTS].
+func (w *WispTrace) QueryByStatus(status string, startTS, endTS int64) ([]wal.SpanPayload, error) {
+	return w.RangeQuery(RangeFilter{Status: status, StartTS: startTS, EndTS: endTS})
+}
+
+// QueryByAgentID returns all live spans matching the given agentID within [startTS, endTS].
+func (w *WispTrace) QueryByAgentID(agentID string, startTS, endTS int64) ([]wal.SpanPayload, error) {
+	return w.RangeQuery(RangeFilter{AgentID: agentID, StartTS: startTS, EndTS: endTS})
+}
+
+// QueryByToolName returns all live spans matching the given toolName within [startTS, endTS].
+func (w *WispTrace) QueryByToolName(toolName string, startTS, endTS int64) ([]wal.SpanPayload, error) {
+	return w.RangeQuery(RangeFilter{ToolName: toolName, StartTS: startTS, EndTS: endTS})
+}
+
 func (w *WispTrace) Flush() error {
 	// Drain the ingest pipeline first: spans acked by InsertSpan are queued
 	// to a background goroutine, and flushAllSessions only sees spans already

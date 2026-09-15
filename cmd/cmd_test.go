@@ -886,3 +886,89 @@ func TestRecoveryPreservesDeleteAfterFlush(t *testing.T) {
 		t.Fatalf("GetSpan(t1, s1) returned live span %+v after crash recovery, want deleted / not resurrected", got)
 	}
 }
+
+func TestTier1AndTier2QueryAPIs(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	// Ingest sample spans across distinct traces and dimensions
+	spans := []wal.SpanPayload{
+		{TraceID: "t1", SpanID: "s1", Timestamp: 100, Model: "gpt-4o", Team: "team-a", Status: "ok", AgentID: "agent-1", ToolName: "search"},
+		{TraceID: "t1", SpanID: "s2", Timestamp: 110, Model: "gpt-4o", Team: "team-a", Status: "ok", AgentID: "agent-1", ToolName: "calculator"},
+		{TraceID: "t2", SpanID: "s3", Timestamp: 120, Model: "claude-3-5-sonnet", Team: "team-b", Status: "error", AgentID: "agent-2", ToolName: "python"},
+		{TraceID: "t3", SpanID: "s4", Timestamp: 130, Model: "gpt-4o", Team: "team-a", Status: "error", AgentID: "agent-1", ToolName: "search"},
+	}
+
+	for _, s := range spans {
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan() error = %v", err)
+		}
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	// 1. Test ListTraces
+	traceIDs, err := wt.ListTraces(RangeFilter{StartTS: 90, EndTS: 150}, 2)
+	if err != nil {
+		t.Fatalf("ListTraces() error = %v", err)
+	}
+	if len(traceIDs) != 2 {
+		t.Fatalf("ListTraces() len = %d, want 2 (capped by limit)", len(traceIDs))
+	}
+
+	allTraceIDs, err := wt.ListTraces(RangeFilter{StartTS: 90, EndTS: 150}, 0)
+	if err != nil {
+		t.Fatalf("ListTraces(all) error = %v", err)
+	}
+	if len(allTraceIDs) != 3 {
+		t.Fatalf("ListTraces(all) len = %d, want 3 distinct trace IDs", len(allTraceIDs))
+	}
+
+	// 2. Test QueryWithCursor
+	page1, cursor1, err := wt.QueryWithCursor(RangeFilter{StartTS: 90, EndTS: 150}, 2, "")
+	if err != nil {
+		t.Fatalf("QueryWithCursor(page1) error = %v", err)
+	}
+	if len(page1) != 2 || cursor1 == "" {
+		t.Fatalf("QueryWithCursor(page1) len = %d, cursor = %q, want len=2 and non-empty cursor", len(page1), cursor1)
+	}
+
+	page2, cursor2, err := wt.QueryWithCursor(RangeFilter{StartTS: 90, EndTS: 150}, 2, cursor1)
+	if err != nil {
+		t.Fatalf("QueryWithCursor(page2) error = %v", err)
+	}
+	if len(page2) != 2 || cursor2 != "" {
+		t.Fatalf("QueryWithCursor(page2) len = %d, cursor = %q, want len=2 and empty cursor", len(page2), cursor2)
+	}
+
+	// 3. Test Tier 2 Convenience Filters
+	byModel, err := wt.QueryByModel("gpt-4o", 90, 150)
+	if err != nil || len(byModel) != 3 {
+		t.Fatalf("QueryByModel(gpt-4o) len = %d, err = %v, want 3", len(byModel), err)
+	}
+
+	byTeam, err := wt.QueryByTeam("team-b", 90, 150)
+	if err != nil || len(byTeam) != 1 {
+		t.Fatalf("QueryByTeam(team-b) len = %d, err = %v, want 1", len(byTeam), err)
+	}
+
+	byStatus, err := wt.QueryByStatus("error", 90, 150)
+	if err != nil || len(byStatus) != 2 {
+		t.Fatalf("QueryByStatus(error) len = %d, err = %v, want 2", len(byStatus), err)
+	}
+
+	byAgent, err := wt.QueryByAgentID("agent-1", 90, 150)
+	if err != nil || len(byAgent) != 3 {
+		t.Fatalf("QueryByAgentID(agent-1) len = %d, err = %v, want 3", len(byAgent), err)
+	}
+
+	byTool, err := wt.QueryByToolName("search", 90, 150)
+	if err != nil || len(byTool) != 2 {
+		t.Fatalf("QueryByToolName(search) len = %d, err = %v, want 2", len(byTool), err)
+	}
+}
