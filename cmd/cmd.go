@@ -1055,6 +1055,212 @@ func (w *WispTrace) QueryByToolName(toolName string, startTS, endTS int64) ([]wa
 	return w.RangeQuery(RangeFilter{ToolName: toolName, StartTS: startTS, EndTS: endTS})
 }
 
+type TokenStats struct {
+	TokensIn  int64 `json:"tokens_in"`
+	TokensOut int64 `json:"tokens_out"`
+	Total     int64 `json:"total"`
+}
+
+type TeamCost struct {
+	Team string  `json:"team"`
+	Cost float64 `json:"cost"`
+}
+
+type ModelCount struct {
+	Model string `json:"model"`
+	Count int64  `json:"count"`
+}
+
+// GetCostByModel returns total dollar cost grouped by model for spans within [startTS, endTS].
+func (w *WispTrace) GetCostByModel(startTS, endTS int64) (map[string]float64, error) {
+	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return nil, err
+	}
+	res := make(map[string]float64)
+	for _, s := range spans {
+		if s.Model != "" {
+			res[s.Model] += s.Cost
+		}
+	}
+	return res, nil
+}
+
+// GetCostByTeam returns total dollar cost grouped by team for spans within [startTS, endTS].
+func (w *WispTrace) GetCostByTeam(startTS, endTS int64) (map[string]float64, error) {
+	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return nil, err
+	}
+	res := make(map[string]float64)
+	for _, s := range spans {
+		if s.Team != "" {
+			res[s.Team] += s.Cost
+		}
+	}
+	return res, nil
+}
+
+// GetTokensByModel returns input, output, and total token count grouped by model within [startTS, endTS].
+func (w *WispTrace) GetTokensByModel(startTS, endTS int64) (map[string]TokenStats, error) {
+	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return nil, err
+	}
+	res := make(map[string]TokenStats)
+	for _, s := range spans {
+		if s.Model != "" {
+			stat := res[s.Model]
+			stat.TokensIn += int64(s.TokensIn)
+			stat.TokensOut += int64(s.TokensOut)
+			stat.Total += int64(s.TokensIn) + int64(s.TokensOut)
+			res[s.Model] = stat
+		}
+	}
+	return res, nil
+}
+
+// GetTopTeamsByCost returns top teams sorted descending by dollar cost within [startTS, endTS], capped at limit.
+func (w *WispTrace) GetTopTeamsByCost(limit int, startTS, endTS int64) ([]TeamCost, error) {
+	byTeam, err := w.GetCostByTeam(startTS, endTS)
+	if err != nil {
+		return nil, err
+	}
+	teams := make([]TeamCost, 0, len(byTeam))
+	for team, cost := range byTeam {
+		teams = append(teams, TeamCost{Team: team, Cost: cost})
+	}
+	sort.Slice(teams, func(i, j int) bool {
+		return teams[i].Cost > teams[j].Cost
+	})
+	if limit > 0 && len(teams) > limit {
+		teams = teams[:limit]
+	}
+	return teams, nil
+}
+
+// GetTopModelsBySpanCount returns top models sorted descending by span count within [startTS, endTS], capped at limit.
+func (w *WispTrace) GetTopModelsBySpanCount(limit int, startTS, endTS int64) ([]ModelCount, error) {
+	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[string]int64)
+	for _, s := range spans {
+		if s.Model != "" {
+			counts[s.Model]++
+		}
+	}
+	models := make([]ModelCount, 0, len(counts))
+	for model, count := range counts {
+		models = append(models, ModelCount{Model: model, Count: count})
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].Count > models[j].Count
+	})
+	if limit > 0 && len(models) > limit {
+		models = models[:limit]
+	}
+	return models, nil
+}
+
+// QueryAggregations returns raw rollup buckets for the given window ("1m", "5m", "1h", "1d") in [startTS, endTS].
+func (w *WispTrace) QueryAggregations(window string, startTS, endTS int64) (map[rollup.BucketKey]*rollup.Value, error) {
+	return w.rollups.GetBucketInRange(window, startTS, endTS)
+}
+
+// GetFailedSpans returns spans with non-success status ("error", etc.) within [startTS, endTS], capped at limit.
+func (w *WispTrace) GetFailedSpans(limit int, startTS, endTS int64) ([]wal.SpanPayload, error) {
+	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return nil, err
+	}
+	var failed []wal.SpanPayload
+	for _, s := range spans {
+		st := strings.ToLower(s.Status)
+		if st != "ok" && st != "success" && st != "" {
+			failed = append(failed, s)
+			if limit > 0 && len(failed) >= limit {
+				break
+			}
+		}
+	}
+	return failed, nil
+}
+
+// GetErrorRate returns the error percentage (0.0 to 100.0) for model (or all models if "") within [startTS, endTS].
+func (w *WispTrace) GetErrorRate(model string, startTS, endTS int64) (float64, error) {
+	spans, err := w.RangeQuery(RangeFilter{Model: model, StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return 0, err
+	}
+	if len(spans) == 0 {
+		return 0, nil
+	}
+	var errorCount int
+	for _, s := range spans {
+		st := strings.ToLower(s.Status)
+		if st != "ok" && st != "success" && st != "" {
+			errorCount++
+		}
+	}
+	return (float64(errorCount) / float64(len(spans))) * 100.0, nil
+}
+
+// GetDistinctModels returns a sorted list of unique model names seen within [startTS, endTS].
+func (w *WispTrace) GetDistinctModels(startTS, endTS int64) ([]string, error) {
+	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var models []string
+	for _, s := range spans {
+		if s.Model != "" && !seen[s.Model] {
+			seen[s.Model] = true
+			models = append(models, s.Model)
+		}
+	}
+	sort.Strings(models)
+	return models, nil
+}
+
+// GetDistinctTeams returns a sorted list of unique team names seen within [startTS, endTS].
+func (w *WispTrace) GetDistinctTeams(startTS, endTS int64) ([]string, error) {
+	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var teams []string
+	for _, s := range spans {
+		if s.Team != "" && !seen[s.Team] {
+			seen[s.Team] = true
+			teams = append(teams, s.Team)
+		}
+	}
+	sort.Strings(teams)
+	return teams, nil
+}
+
+// GetDistinctAgents returns a sorted list of unique agent IDs seen within [startTS, endTS].
+func (w *WispTrace) GetDistinctAgents(startTS, endTS int64) ([]string, error) {
+	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var agents []string
+	for _, s := range spans {
+		if s.AgentID != "" && !seen[s.AgentID] {
+			seen[s.AgentID] = true
+			agents = append(agents, s.AgentID)
+		}
+	}
+	sort.Strings(agents)
+	return agents, nil
+}
+
 func (w *WispTrace) Flush() error {
 	// Drain the ingest pipeline first: spans acked by InsertSpan are queued
 	// to a background goroutine, and flushAllSessions only sees spans already

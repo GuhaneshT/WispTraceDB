@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -970,5 +971,97 @@ func TestTier1AndTier2QueryAPIs(t *testing.T) {
 	byTool, err := wt.QueryByToolName("search", 90, 150)
 	if err != nil || len(byTool) != 2 {
 		t.Fatalf("QueryByToolName(search) len = %d, err = %v, want 2", len(byTool), err)
+	}
+}
+
+func TestTier3AndTier4QueryAPIs(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	spans := []wal.SpanPayload{
+		{TraceID: "t1", SpanID: "s1", Timestamp: 100, Model: "gpt-4o", Team: "team-a", AgentID: "agent-1", Status: "ok", Cost: 0.10, TokensIn: 100, TokensOut: 200},
+		{TraceID: "t1", SpanID: "s2", Timestamp: 110, Model: "gpt-4o", Team: "team-a", AgentID: "agent-1", Status: "ok", Cost: 0.20, TokensIn: 200, TokensOut: 300},
+		{TraceID: "t2", SpanID: "s3", Timestamp: 120, Model: "claude-3-5-sonnet", Team: "team-b", AgentID: "agent-2", Status: "error", Cost: 0.50, TokensIn: 500, TokensOut: 500},
+		{TraceID: "t3", SpanID: "s4", Timestamp: 130, Model: "gpt-4o", Team: "team-a", AgentID: "agent-1", Status: "error", Cost: 0.15, TokensIn: 150, TokensOut: 150},
+	}
+
+	for _, s := range spans {
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan() error = %v", err)
+		}
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	// 1. Cost By Model & Team
+	costByModel, err := wt.GetCostByModel(90, 150)
+	if err != nil || math.Abs(costByModel["gpt-4o"]-0.45) > 1e-6 || math.Abs(costByModel["claude-3-5-sonnet"]-0.50) > 1e-6 {
+		t.Fatalf("GetCostByModel() = %v, err = %v", costByModel, err)
+	}
+
+	costByTeam, err := wt.GetCostByTeam(90, 150)
+	if err != nil || math.Abs(costByTeam["team-a"]-0.45) > 1e-6 || math.Abs(costByTeam["team-b"]-0.50) > 1e-6 {
+		t.Fatalf("GetCostByTeam() = %v, err = %v", costByTeam, err)
+	}
+
+	// 2. Tokens By Model
+	tokensByModel, err := wt.GetTokensByModel(90, 150)
+	if err != nil {
+		t.Fatalf("GetTokensByModel() error = %v", err)
+	}
+	if tokensByModel["gpt-4o"].TokensIn != 450 || tokensByModel["gpt-4o"].TokensOut != 650 || tokensByModel["gpt-4o"].Total != 1100 {
+		t.Fatalf("GetTokensByModel(gpt-4o) = %+v, want TokensIn=450, TokensOut=650, Total=1100", tokensByModel["gpt-4o"])
+	}
+
+	// 3. Top Rankings
+	topTeams, err := wt.GetTopTeamsByCost(1, 90, 150)
+	if err != nil || len(topTeams) != 1 || topTeams[0].Team != "team-b" {
+		t.Fatalf("GetTopTeamsByCost() = %+v, err = %v, want top team-b", topTeams, err)
+	}
+
+	topModels, err := wt.GetTopModelsBySpanCount(1, 90, 150)
+	if err != nil || len(topModels) != 1 || topModels[0].Model != "gpt-4o" || topModels[0].Count != 3 {
+		t.Fatalf("GetTopModelsBySpanCount() = %+v, err = %v, want top gpt-4o with count 3", topModels, err)
+	}
+
+	// 4. QueryAggregations
+	buckets, err := wt.QueryAggregations("1m", 0, 200000000000)
+	if err != nil {
+		t.Fatalf("QueryAggregations() error = %v", err)
+	}
+	if len(buckets) == 0 {
+		t.Fatalf("QueryAggregations() returned 0 buckets, want >0")
+	}
+
+	// 5. Error Analytics
+	failed, err := wt.GetFailedSpans(0, 90, 150)
+	if err != nil || len(failed) != 2 {
+		t.Fatalf("GetFailedSpans() len = %d, err = %v, want 2", len(failed), err)
+	}
+
+	errRate, err := wt.GetErrorRate("gpt-4o", 90, 150)
+	if err != nil || errRate < 33.3 || errRate > 33.4 {
+		t.Fatalf("GetErrorRate(gpt-4o) = %f, err = %v, want ~33.33%%", errRate, err)
+	}
+
+	// 6. Distinct Dimensions
+	models, err := wt.GetDistinctModels(90, 150)
+	if err != nil || len(models) != 2 || models[0] != "claude-3-5-sonnet" || models[1] != "gpt-4o" {
+		t.Fatalf("GetDistinctModels() = %v, err = %v", models, err)
+	}
+
+	teams, err := wt.GetDistinctTeams(90, 150)
+	if err != nil || len(teams) != 2 || teams[0] != "team-a" || teams[1] != "team-b" {
+		t.Fatalf("GetDistinctTeams() = %v, err = %v", teams, err)
+	}
+
+	agents, err := wt.GetDistinctAgents(90, 150)
+	if err != nil || len(agents) != 2 || agents[0] != "agent-1" || agents[1] != "agent-2" {
+		t.Fatalf("GetDistinctAgents() = %v, err = %v", agents, err)
 	}
 }
