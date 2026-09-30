@@ -1,0 +1,48 @@
+WispTraceDB Benchmark Analysis & Optimization Guide
+This document breaks down the results from our initial performance benchmarks and outlines the architectural bottlenecks that must be resolved before moving toward a production release. It also includes study materials and research links to help design robust solutions.
+
+1. The Write Path Bottleneck (WAL Ingestion)
+The Symptom:
+
+Sequential Insert: ~0.37 ms per operation
+Parallel Insert: ~0.35 ms per operation (No meaningful improvement)
+The Root Cause: The database is suffering from lock contention and sequential I/O throttling. In InsertSpan, the system acquires a lock, appends the record to the Write-Ahead Log (WAL), calls fsync() to guarantee durability, and then releases the lock. Because fsync() physically writes to the disk platter or NVMe flash controller, concurrent goroutines are forced to wait in a single-file line. The maximum throughput is strictly capped by the physical IOPS limit of your storage drive.
+
+The Solution: WAL Group Commit Group Commit decouples the logical commit of a transaction from the physical disk flush. Instead of every goroutine waiting for its own fsync, spans are batched into a shared buffer. A background coordinator (or the first waiting goroutine) issues a single fsync for the entire batch, waking up all waiting goroutines simultaneously. This amortizes the cost of one disk flush across thousands of spans.
+
+Study Material:
+
+WAL Group Commit in PostgreSQL
+ (Concepts of synchronous vs asynchronous group commits).
+MySQL InnoDB Group Commit Architecture
+Keywords for research: "Database WAL Group Commit", "Log Sequence Number (LSN) batching".
+2. The Point Lookup Bottleneck (Segment File Opening)
+The Symptom:
+
+GetSpan: 0.14 ms per lookup (140µs)
+Memory: 35 allocations and 14.5 KB allocated per single point lookup.
+The Root Cause: While the LSM index (Pebble) finds the segment offset in under a microsecond, reading the actual payload from the custom columnar segment is incredibly expensive. The high allocation count strongly implies that the system is calling os.Open() on the segment file, reading the bytes, and closing the file for every single lookup. The OS syscall overhead and file descriptor allocation are destroying latency.
+
+The Solution: File Descriptor LRU Cache & mmap Databases cannot hold thousands of segment files open simultaneously (due to OS ulimit restrictions on file descriptors). The standard solution is an LRU (Least Recently Used) Cache for file handles. Hot segments remain open, while cold segments are closed when the cache reaches capacity. Alternatively, mmap (memory-mapping) can be used to map the segment files directly into virtual memory, allowing the OS kernel's Page Cache to handle lazy-loading without explicit Read() syscalls.
+
+Study Material:
+
+LevelDB/Pebble Table Cache Implementation
+ (Study how Pebble uses a TableCache to keep SSTable file descriptors open).
+mmap vs standard I/O in Databases
+ (A critical look at why mmap is useful, but why some modern DBs are moving away from it).
+Keywords for research: "File Descriptor LRU Cache Golang", "Database mmap vs pread".
+3. The Analytical Scan Bottleneck (Garbage Collection Pressure)
+The Symptom:
+
+RangeQuery: 2.5 ms per query
+Memory: 13,228 allocations and 743 KB allocated per query.
+The Root Cause: When performing a range scan across segments, the system is dynamically allocating a brand new wal.SpanPayload struct on the heap for every single row it evaluates. In a production environment with hundreds of concurrent analytical queries, this will instantly allocate gigabytes of short-lived objects, causing the Go Garbage Collector (GC) to trigger "Stop The World" pauses that freeze the entire database.
+
+The Solution: Zero-Allocation Iterators via sync.Pool Database scanning must be allocation-free on the hot path. Instead of returning slices of newly allocated structs, the RangeQuery should use an Iterator Pattern. The iterator decodes data into a single, reusable struct (or fetches one from a sync.Pool). The caller processes the data, and the iterator overwrites that exact same memory address for the next row.
+
+Study Material:
+
+Understanding Go's sync.Pool
+Zero-Allocation Iterators in Go
+Keywords for research: "Golang zero allocation iterator", "sync.Pool database cursor pattern".

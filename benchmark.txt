@@ -1,0 +1,12 @@
+goos: windows
+goarch: amd64
+pkg: github.com/GuhaneshT/WispTraceDB/cmd
+cpu: 12th Gen Intel(R) Core(TM) i7-1250U
+date: 26-09-2026
+BenchmarkInsertSpan_Sequential-12           3139            373246 ns/op            2394 B/op6 allocs/op
+BenchmarkInsertSpan_Parallel-12             3310            356699 ns/op            1986 B/op5 allocs/op
+BenchmarkGetSpan-12                         8352            140070 ns/op           14547 B/op         35 allocs/op
+BenchmarkGetTrace-12                        5140            233838 ns/op           19750 B/op        147 allocs/op
+BenchmarkRangeQuery-12                       471           2518068 ns/op          743389 B/op      13228 allocs/op
+PASS
+ok      github.com/GuhaneshT/WispTraceDB/cmd    52.586s

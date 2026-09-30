@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/GuhaneshT/WispTraceDB/pebble"
 	"github.com/GuhaneshT/WispTraceDB/segment"
@@ -21,6 +22,7 @@ func testConfig(t *testing.T) WispTraceConfig {
 	cfg.CheckpointPath = filepath.Join(dir, "checkpoint.dat")
 	cfg.ManifestPath = filepath.Join(dir, "manifest.dat")
 	cfg.SegmentFlushThreshold = 3
+	cfg.RetentionPeriod = 100 * 365 * 24 * time.Hour // 100 years to prevent test spans with TS=100 from being evicted
 	return cfg
 }
 
