@@ -44,7 +44,23 @@ func TestCheckConsistencyCleanStore(t *testing.T) {
 	}
 }
 
-func TestCheckConsistencyDetectsMissingIndexEntry(t *testing.T) {
+// TestCheckConsistencyReportsLiveRecordWithNoIndexEntry pins a deliberate
+// downgrade from error to warning.
+//
+// This state is genuinely ambiguous. It is what a span looks like when it was
+// deleted after its segment was written — the record is on disk, and the
+// deletion exists only as the absence of an index entry. It is also what a lost
+// index write looks like. Segments and index cannot tell those apart, and now
+// that deletions are applied by deleting the index key, EVERY deleted span
+// produces this shape until compaction reclaims it. Leaving it as an error
+// would mean the checker cries wolf on every deletion in a healthy database.
+//
+// The dangerous direction is still a hard error and is covered by
+// TestCheckConsistencyDetectsIndexPointingAtMissingSegment: an index entry
+// that resolves to nothing readable is a dangling pointer and is
+// unambiguously corruption. Losing automated detection of the other direction
+// is tracked as an open gap, not overlooked.
+func TestCheckConsistencyReportsLiveRecordWithNoIndexEntry(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.SegmentFlushThreshold = 2
 	wt, err := CreateWispTraceWithConfig(cfg)
@@ -62,15 +78,11 @@ func TestCheckConsistencyDetectsMissingIndexEntry(t *testing.T) {
 	}
 
 	rep := wt.CheckConsistency()
-	if rep.OK() {
-		t.Fatal("CheckConsistency() = OK, want an error for the live span whose index entry was deleted")
+	if len(rep.Errors) != 0 {
+		t.Fatalf("CheckConsistency() errors = %v, want none: an unindexed live record is ambiguous between deletion and a lost write, so it cannot be an error", rep.Errors)
 	}
-	found := false
-	for _, e := range rep.Errors {
-		found = found || contains([]string{e}, "s1", "no index entry")
-	}
-	if !found {
-		t.Fatalf("CheckConsistency() errors = %v, want one for t1||s1 missing index entry", rep.Errors)
+	if !contains(rep.Warnings, "s1", "no index entry") {
+		t.Fatalf("CheckConsistency() warnings = %v, want one for t1||s1 with no index entry", rep.Warnings)
 	}
 }
 

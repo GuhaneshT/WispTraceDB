@@ -664,7 +664,12 @@ func TestRangeQueryBloomPruningDoesNotAffectCorrectness(t *testing.T) {
 	}
 }
 
-func TestGetSpanFindsTombstonedSpanWithDeletedSet(t *testing.T) {
+// A tombstoned span must be reported as ABSENT, not as a readable record with
+// Deleted set. This test previously asserted the opposite — "a tombstone is
+// still an indexed record, not absent" — which encoded the exact convention
+// that made deleted spans readable through GetSpan and GetTrace. The flush path
+// now deletes the key from the index, so there is nothing to read.
+func TestGetSpanDoesNotReturnTombstonedSpan(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.SegmentFlushThreshold = 1
 	wt, err := CreateWispTraceWithConfig(cfg)
@@ -683,11 +688,8 @@ func TestGetSpanFindsTombstonedSpanWithDeletedSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSpan() error = %v", err)
 	}
-	if !found {
-		t.Fatal("GetSpan() found = false, want true — a tombstone is still an indexed record, not absent")
-	}
-	if !got.Deleted {
-		t.Fatal("GetSpan().Deleted = false, want true")
+	if found {
+		t.Fatalf("GetSpan() found = true for a deleted span (Deleted=%v): %+v", got.Deleted, got)
 	}
 }
 
@@ -880,14 +882,21 @@ func TestRecoveryPreservesDeleteAfterFlush(t *testing.T) {
 	}
 	defer wt2.Close()
 
-	// Post-recovery, GetSpan("t1", "s1") must NOT return a live, un-deleted span.
+	// Post-recovery, GetSpan("t1", "s1") must not return the span at all. The
+	// tombstone is durable in the WAL tail and replayed, so the correct result is
+	// "not found" — not "found, but with Deleted set". The previous assertion
+	// (`found && !got.Deleted`) passed for a GetSpan that handed back the
+	// tombstone record, which is the bug it was written to catch.
 	got, found, err := wt2.GetSpan("t1", "s1")
 	if err != nil {
 		t.Fatalf("GetSpan(t1, s1) error = %v", err)
 	}
-	if found && !got.Deleted {
-		t.Fatalf("GetSpan(t1, s1) returned live span %+v after crash recovery, want deleted / not resurrected", got)
+	if found {
+		t.Fatalf("GetSpan(t1, s1) returned %+v after crash recovery, want not found: the delete was durable and must not be resurrected", got)
 	}
+
+	// The trace must be gone too, and the whole trace must not reappear.
+	assertTraceGone(t, wt2, "t1")
 }
 
 func TestTier1AndTier2QueryAPIs(t *testing.T) {

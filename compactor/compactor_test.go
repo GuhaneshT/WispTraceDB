@@ -184,11 +184,15 @@ func TestCompactAllTombstonesWritesNoNewSegment(t *testing.T) {
 // TestCompactSkipsStaleSpansSupersededElsewhere is the core regression test
 // for the staleness check (see package doc). Segment 1 holds the original
 // insert for key (t1, s1); segment 2, flushed later, holds a tombstone for
-// the SAME key — exactly what happens in the real system when a span is
-// deleted after its containing segment was already flushed. setup's
-// BatchPutSpans calls mirror cmd.go's real flush order, so by the time both
-// segments exist, Pebble's current entry for (t1, s1) points at segment 2,
-// not segment 1.
+// the SAME key.
+//
+// Note that setup indexes the tombstone via BatchPutSpans, which is no longer
+// what the flush path does — writeSegmentBatch deletes a tombstoned key from
+// the index instead of repointing it at the tombstone record. So the layout
+// built here is the PRE-FIX one: a segment on disk whose tombstone is still
+// indexed. It is worth keeping, because that is exactly what an existing
+// database looks like after upgrading, and the second shape of supersession
+// (key absent from the index entirely) must not resurrect a span either.
 //
 // Compacting segment 1 ALONE (never touching segment 2) must not resurrect
 // the deleted span: it must recognize its copy of (t1, s1) is stale, skip
@@ -247,6 +251,106 @@ func TestCompactSkipsStaleSpansSupersededElsewhere(t *testing.T) {
 	// it was never part of this compaction.
 	if _, err := os.Stat(segment.SegmentPath(segDir, segment2ID)); err != nil {
 		t.Fatalf("segment 2 should still exist, stat err = %v", err)
+	}
+}
+
+// TestCompactDropsLiveRecordWhoseKeyWasTombstoned covers the other shape of
+// supersession, and the one production now actually produces: a tombstoned key
+// is DELETED from the index rather than repointed at the tombstone record. The
+// original live record in an older segment therefore finds no index entry at
+// all, which must read as "superseded, drop it" and never as "unindexed, keep
+// it" — otherwise compacting the old segment resurrects a deleted span and
+// writes it straight back into the index.
+func TestCompactDropsLiveRecordWhoseKeyWasTombstoned(t *testing.T) {
+	segDir, idx, manifest, ids := setup(t, [][]wal.SpanPayload{
+		{testSpan("t1", "s1", 100, false)}, // segment 1: original live insert
+		{testSpan("t1", "s1", 200, true)},  // segment 2: tombstone, same key
+	})
+	segment1ID := ids[0]
+	key := segment.CompositeKey("t1", "s1")
+
+	// Model the production flush path: a tombstoned key is removed from the
+	// index, so segment 1's live record is now unreachable.
+	if err := idx.DeleteSpan([]byte(key)); err != nil {
+		t.Fatalf("DeleteSpan() error = %v", err)
+	}
+	if _, err := idx.GetSpan([]byte(key)); err == nil {
+		t.Fatal("tombstone should have removed the index entry")
+	}
+
+	c := New(segDir, manifest, idx)
+	result, err := c.Compact([]uint64{segment1ID}, 99)
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	if result.SpansCarried != 0 {
+		t.Fatalf("SpansCarried = %d, want 0 — a span with no index entry is superseded, not carryable", result.SpansCarried)
+	}
+	if result.SpansStale != 1 {
+		t.Fatalf("SpansStale = %d, want 1", result.SpansStale)
+	}
+	if result.NewSegmentID != 0 {
+		t.Fatalf("NewSegmentID = %d, want 0 (nothing survived)", result.NewSegmentID)
+	}
+	if _, err := os.Stat(segment.SegmentPath(segDir, 99)); !os.IsNotExist(err) {
+		t.Fatalf("no merged segment should have been written, stat err = %v", err)
+	}
+
+	// The deleted span must stay deleted, and must not have been re-indexed
+	// at its old location.
+	if _, err := idx.GetSpan([]byte(key)); err == nil {
+		t.Fatal("compaction resurrected the tombstoned span into the index")
+	}
+}
+
+// TestCompactStaleTombstoneDoesNotEraseReinsertedSpan pins the ordering inside
+// the scan loop: the staleness check must run BEFORE the tombstone test.
+//
+// If a tombstone is handled first, its key goes into reclaimKeys and
+// BatchDeleteSpans then erases whatever the index currently holds for that key —
+// which, after a re-insert of the same span id, is the live record. Compacting
+// an old tombstone segment would silently make a live span unreadable. Only the
+// tombstone the index actually points at may be reclaimed.
+//
+// Uses the pre-fix layout (tombstone indexed) deliberately, since that is the
+// only case in which a tombstone is ever a reclaim candidate.
+func TestCompactStaleTombstoneDoesNotEraseReinsertedSpan(t *testing.T) {
+	segDir, idx, manifest, ids := setup(t, [][]wal.SpanPayload{
+		{testSpan("t1", "s1", 100, true)},  // segment 1: tombstone
+		{testSpan("t1", "s1", 300, false)}, // segment 2: re-inserted, live
+	})
+	segment1ID, segment2ID := ids[0], ids[1]
+	key := segment.CompositeKey("t1", "s1")
+
+	before, err := idx.GetSpan([]byte(key))
+	if err != nil {
+		t.Fatalf("GetSpan() before compaction error = %v", err)
+	}
+	if before.SegmentID != segment2ID {
+		t.Fatalf("test setup invariant broken: index points at segment %d, want %d", before.SegmentID, segment2ID)
+	}
+
+	c := New(segDir, manifest, idx)
+	result, err := c.Compact([]uint64{segment1ID}, 99)
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	if result.SpansStale != 1 {
+		t.Fatalf("SpansStale = %d, want 1 (the tombstone is superseded by the re-insert)", result.SpansStale)
+	}
+	if result.SpansDropped != 0 {
+		t.Fatalf("SpansDropped = %d, want 0 — a superseded tombstone must not be reclaimed", result.SpansDropped)
+	}
+
+	// The re-inserted live span must remain indexed and unchanged.
+	after, err := idx.GetSpan([]byte(key))
+	if err != nil {
+		t.Fatalf("GetSpan() after compaction error = %v — the re-inserted span's index entry was erased", err)
+	}
+	if after.SegmentID != segment2ID || after.Offset != before.Offset {
+		t.Fatalf("GetSpan() after compaction = %+v, want unchanged %+v", after, before)
 	}
 }
 

@@ -37,10 +37,10 @@ import (
 // file handles behind, so the driver retries the reopen briefly.
 
 const (
-	faultWorkerEnv    = "WISPTRACE_FAULT_WORKER"
-	faultDirEnv       = "WISPTRACE_FAULT_DIR"
-	faultOracleEnv    = "WISPTRACE_FAULT_ORACLE"
-	faultMaxEnv       = "WISPTRACE_FAULT_MAX"
+	faultWorkerEnv = "WISPTRACE_FAULT_WORKER"
+	faultDirEnv    = "WISPTRACE_FAULT_DIR"
+	faultOracleEnv = "WISPTRACE_FAULT_ORACLE"
+	faultMaxEnv    = "WISPTRACE_FAULT_MAX"
 
 	faultTraces        = 50
 	faultTombstoneEach = 17
@@ -258,7 +258,10 @@ func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, ma
 		t.Logf("consistency warning: %s", w)
 	}
 
-	// 1. Acked spans must survive. Tombstones must never come back live.
+	// 1. Acked spans must survive. A tombstoned span must not be readable at
+	// all: found must be false, not "found and flagged Deleted". Asserting
+	// found && !span.Deleted would pass for a GetSpan that hands back the
+	// tombstone, which is precisely the bug this harness is meant to catch.
 	var missing []int
 	for seq := range acked {
 		traceID, spanID := fmt.Sprintf("t-%d", seq%faultTraces), fmt.Sprintf("s-%d", seq)
@@ -267,14 +270,17 @@ func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, ma
 			t.Fatalf("GetSpan(%s,%s) error = %v", traceID, spanID, ge)
 		}
 		if seq%faultTombstoneEach == 0 {
-			if found && !span.Deleted {
-				t.Fatalf("tombstoned span %d came back live", seq)
+			if found {
+				t.Fatalf("tombstoned span %d came back readable: Deleted=%v", seq, span.Deleted)
 			}
 			continue
 		}
 		if !found {
 			missing = append(missing, seq)
 			continue
+		}
+		if span.Deleted {
+			t.Fatalf("live span %d came back as a tombstone", seq)
 		}
 		if string(span.Payload) != strconv.Itoa(seq) {
 			t.Fatalf("span %d payload after recovery = %q, want %q", seq, span.Payload, strconv.Itoa(seq))
@@ -528,12 +534,25 @@ func TestFaultInjectionInsertFlushDeleteCrash(t *testing.T) {
 	}
 	defer wt2.Close()
 
-	// Step 5: Assert that post-recovery, the span is NOT resurrected as a live span.
+	// Step 5: Assert that post-recovery the span is NOT readable. "found" must
+	// be false — accepting a returned tombstone is the bug, not a pass.
 	got, found, err := wt2.GetSpan("t-fault-reuse", "s-fault-reuse-1")
 	if err != nil {
 		t.Fatalf("GetSpan after recovery error = %v", err)
 	}
-	if found && !got.Deleted {
-		t.Fatalf("span resurrected after crash recovery: got %+v, want deleted", got)
+	if found {
+		t.Fatalf("span resurrected after crash recovery: got %+v, want not found", got)
+	}
+
+	// Step 6: The same must hold for trace reconstruction, which is a separate
+	// read path (prefix scan) and historically applied no tombstone filter at
+	// all. A tombstone that survives here is invisible to a point lookup but
+	// still leaks through the trace API.
+	traceSpans, traceFound, err := wt2.GetTrace("t-fault-reuse")
+	if err != nil {
+		t.Fatalf("GetTrace after recovery error = %v", err)
+	}
+	if traceFound {
+		t.Fatalf("tombstoned span resurfaced through GetTrace: %+v", traceSpans)
 	}
 }
