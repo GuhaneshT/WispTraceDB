@@ -9,7 +9,6 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
-
 var ErrNotFound = pebble.ErrNotFound
 
 // SpanLocation is the value stored in Pebble
@@ -35,7 +34,6 @@ func OpenDB(path string) (*DB, error) {
 	}
 	return &DB{db: lsmdb, path: path}, nil
 }
-
 
 // spanLocationBufPool holds reusable 16-byte location buffers for PutSpan.
 // Encoding happens without holding the Pebble lock, so concurrent callers
@@ -97,12 +95,12 @@ func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 	if d.db == nil {
 		return nil, fmt.Errorf("pebble db is closed")
 	}
-	iter,err := d.db.NewIter(&pebble.IterOptions{
+	iter, err := d.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixUpperBound(prefix),
 	})
-	if err!=nil{
-		return nil,fmt.Errorf("Pebble Iterator error")
+	if err != nil {
+		return nil, fmt.Errorf("Pebble Iterator error")
 	}
 	defer iter.Close()
 
@@ -116,8 +114,6 @@ func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 	}
 	return locations, nil
 }
-
-
 
 // ScanAll returns every (key -> SpanLocation) currently in the index, keyed
 // by the raw trace_id||span_id composite key. Used by cmd.CheckConsistency to
@@ -189,6 +185,49 @@ func (d *DB) BatchPutSpans(entries map[string]SpanLocation) error {
 	return batch.Commit(&pebble.WriteOptions{Sync: true})
 }
 
+// BatchApplySpans atomically applies a set of puts and a set of deletes in one
+// committed batch. Used on the segment-flush path, where a single batch has to
+// both index a segment's live records and remove the tombstones among them —
+// committing them separately would leave a window where a span is indexed at
+// its new location while a tombstoned key still resolves to its pre-delete
+// record.
+//
+// Deletes are applied before puts inside the batch, which is the safe
+// intermediate order: a key mid-delete resolves to not-found rather than to its
+// old value.
+func (d *DB) BatchApplySpans(puts map[string]SpanLocation, deleteKeys []string) error {
+	if d.db == nil {
+		return fmt.Errorf("pebble db is closed")
+	}
+	if len(puts) == 0 && len(deleteKeys) == 0 {
+		return nil
+	}
+
+	batch := d.db.NewBatch()
+	defer batch.Close()
+
+	for _, keyStr := range deleteKeys {
+		if err := batch.Delete([]byte(keyStr), nil); err != nil {
+			return fmt.Errorf("batch.Delete(%q): %w", keyStr, err)
+		}
+	}
+
+	for keyStr, location := range puts {
+		bufPtr := spanLocationBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		encodeSpanLocationInto(buf, location)
+		// Batch.Set copies the key and value, so the pooled buffer is safe to
+		// return immediately — same as BatchPutSpans above.
+		if err := batch.Set([]byte(keyStr), buf, nil); err != nil {
+			spanLocationBufPool.Put(bufPtr)
+			return fmt.Errorf("batch.Set(%q): %w", keyStr, err)
+		}
+		spanLocationBufPool.Put(bufPtr)
+	}
+
+	return batch.Commit(&pebble.WriteOptions{Sync: true})
+}
+
 // BatchDeleteSpans removes multiple spans atomically (used at compaction time when
 // a segment is dropped and its entries must be removed from the index together).
 func (d *DB) BatchDeleteSpans(keys []string) error {
@@ -233,16 +272,15 @@ func decodeSpanLocation(data []byte) (SpanLocation, error) {
 	}, nil
 }
 
-
 func prefixUpperBound(prefix []byte) []byte {
-    upper := append([]byte(nil), prefix...)
+	upper := append([]byte(nil), prefix...)
 
-    for i := len(upper) - 1; i >= 0; i-- {
-        if upper[i] != 0xff {
-            upper[i]++
-            return upper[:i+1]
-        }
-    }
+	for i := len(upper) - 1; i >= 0; i-- {
+		if upper[i] != 0xff {
+			upper[i]++
+			return upper[:i+1]
+		}
+	}
 
-    return nil
+	return nil
 }

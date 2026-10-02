@@ -4,10 +4,15 @@
 // Staleness check: unlike a classic LSM, Pebble here holds exactly one
 // current (segment_id, offset) per key — no fallback scan across segments.
 // So before touching any scanned span, we check it's still Pebble's current
-// entry for that key; if not, it's superseded elsewhere (usually a later
-// tombstone) and must be left untouched. This makes tombstone reclamation
-// always safe, with no need to track whether a merge is "major" (covers
-// every segment) the way a classic LSM compactor would.
+// entry for that key; if not, it is superseded and must be left untouched.
+// This makes tombstone reclamation always safe, with no need to track whether a
+// merge is "major" (covers every segment) the way a classic LSM compactor would.
+//
+// Superseded splits into two shapes here. A key that was overwritten lands on a
+// different (segment, offset). A key that was tombstoned has no index entry at
+// all, because the flush path deletes tombstone keys rather than repointing
+// them. Both fail the check, and both must be dropped rather than carried into
+// a merged segment.
 //
 // Crash safety comes from ordering alone: write the new segment (harmless if
 // orphaned) -> commit the Pebble batch (retryable if it fails) -> swap the
@@ -67,13 +72,30 @@ func (c *Compactor) Compact(oldIDs []uint64, newSegmentID uint64) (*Result, erro
 		for _, s := range spans {
 			key := segment.CompositeKey(s.Span.TraceID, s.Span.SpanID)
 
+			// Staleness check, and it must run BEFORE the tombstone test. Pebble
+			// holds exactly one (segment_id, offset) per key with no
+			// cross-segment fallback, so a copy the index no longer points at is
+			// a superseded version and must be left completely alone.
+			//
+			// Including tombstones. A tombstone that is NOT the index's current
+			// entry has been superseded — by a re-insert of the same key, say —
+			// and acting on it would delete the newer live version's index entry
+			// (see reclaimKeys below), making a live span unreadable. Only the
+			// tombstone the index actually points at may be reclaimed.
+			//
+			// Note this now also covers the common case: a post-fix tombstone is
+			// deleted from the index at flush time, so the lookup misses and the
+			// record is classified stale. That is correct — it is already dead and
+			// there is nothing to clean up.
 			current, err := c.index.GetSpan([]byte(key))
 			if err != nil || current.SegmentID != id || current.Offset != s.Offset {
-				// Reclaimed already, or superseded by a write elsewhere.
 				staleCount++
 				continue
 			}
 
+			// The index points at this record and the record is a tombstone: it
+			// is the authoritative delete, so reclaim the key and never carry
+			// the tombstone into a merged segment.
 			if s.Span.Deleted {
 				droppedCount++
 				reclaimKeys = append(reclaimKeys, key)

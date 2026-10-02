@@ -33,17 +33,29 @@ func (r *ConsistencyReport) addWarning(format string, args ...interface{}) {
 // CheckConsistency cross-checks the on-disk state tree: manifest vs segment
 // files, trace index vs segments (both directions), and checkpoint sanity.
 //
-// Invariants checked:
+// Invariants checked as ERRORS:
 //   - every manifest-listed segment exists, parses, and matches its header id;
 //   - every record in every manifest segment decodes and CRC-checks;
 //   - every index entry resolves through a readable segment to a record whose
 //     composite key matches the key it is filed under;
-//   - every live (non-tombstoned) record in a manifest segment is indexed at
-//     its exact (segment_id, offset). Tombstoned records may be present or
-//     reclaimed, but never inconsistently pointed at;
-//   - checkpoint never exceeds the highest segment id on disk;
-//   - segment files not present in the manifest are reported as warnings
-//     (benign crash residue — the id allocator and recovery already skip them).
+//   - a live record's index entry, when present, points at that exact
+//     (segment_id, offset);
+//   - checkpoint never exceeds the highest segment id on disk.
+//
+// Checked as WARNINGS (real, but not automatically actionable):
+//   - a live record with no index entry. Since tombstones are applied by
+//     deleting the index key rather than by rewriting the immutable segment,
+//     this is the expected state of every span deleted after its segment was
+//     written, until compaction reclaims the space. It is indistinguishable,
+//     from segments and index alone, from a genuinely lost index write — so
+//     this direction cannot be a hard check without a separate record of
+//     which keys were deliberately deleted. See "lost index-write detection"
+//     in docs/TECHNICAL-GUIDE.md;
+//   - a tombstoned record still present in the index (only possible for
+//     segments predating delete-at-flush, and the shape that let GetSpan
+//     return deleted spans);
+//   - segment files absent from the manifest — benign crash residue, since
+//     the id allocator and recovery already skip them.
 func (w *WispTrace) CheckConsistency() *ConsistencyReport {
 	rep := &ConsistencyReport{}
 
@@ -133,29 +145,59 @@ func (w *WispTrace) CheckConsistency() *ConsistencyReport {
 		}
 	}
 
-	// Reverse direction: every live record in a manifest segment must be
-	// indexed at exactly its own (segment_id, offset). Records filed under a
-	// segment the index no longer references are superseded (safe to leave;
-	// unreferenced segments are dropped from the manifest by reconciliation).
+	// Reverse direction: a live record in a manifest segment should be indexed
+	// at exactly its own (segment_id, offset).
+	//
+	// This is a WARNING, not an error, and deliberately so. Since tombstones are
+	// applied by deleting the index key rather than by rewriting the segment, a
+	// span deleted after its segment was written leaves a live record in that
+	// segment with no index entry at all — the normal, expected state for every
+	// deleted span until compaction reclaims the space. That is indistinguishable
+	// from a genuinely lost index entry when you are looking only at segments,
+	// so flagging it as an error would fire on every deletion in the database.
+	//
+	// The dangerous direction is still checked as an error, above: an index
+	// entry that resolves to nothing readable is a dangling pointer, and that is
+	// unambiguously corruption.
 	for _, id := range live {
 		spans, err := w.scanSegmentRecords(id)
 		if err != nil {
 			rep.addError("segment %d rescan: %v", id, err)
 			continue
 		}
+
+		// A segment written before the flush path deduplicated its batch can
+		// hold several records for one key (insert then delete in the same
+		// window). Only the LAST is authoritative — that is the one the index
+		// points at, and the one the compactor carries forward. The earlier
+		// ones are superseded, so they are not expected to be indexed and must
+		// not be reported at all.
+		authoritative := make(map[string]uint64, len(spans))
+		for _, sc := range spans {
+			authoritative[segment.CompositeKey(sc.Span.TraceID, sc.Span.SpanID)] = sc.Offset
+		}
+
 		for _, sc := range spans {
 			key := segment.CompositeKey(sc.Span.TraceID, sc.Span.SpanID)
+			if authoritative[key] != sc.Offset {
+				continue
+			}
 			loc, ok := indexed[key]
 			if sc.Span.Deleted {
-				if ok && (loc.SegmentID != id || loc.Offset != sc.Offset) {
-					// tombstones may be reclaimed entirely, but if still
-					// indexed they must point at this exact record
-					rep.addWarning("tombstoned span %q in segment %d is indexed as segment %d offset %d", key, id, loc.SegmentID, loc.Offset)
+				// A tombstoned key is deleted from the index at flush time, so
+				// the expected state is "absent". It may still be present if
+				// the segment predates that behaviour; warn, because it is
+				// exactly the shape that let GetSpan return deleted spans.
+				if ok {
+					rep.addWarning("tombstoned span %q in segment %d is still indexed as segment %d offset %d", key, id, loc.SegmentID, loc.Offset)
 				}
 				continue
 			}
 			if !ok {
-				rep.addError("live span %q in segment %d has no index entry", key, id)
+				// Expected if the span was tombstoned after this segment was
+				// written; also the shape of a lost index entry. Compaction
+				// reclaims the space either way.
+				rep.addWarning("live span %q in segment %d has no index entry (expected if it was deleted after the segment was written; compaction reclaims it)", key, id)
 				continue
 			}
 			if loc.SegmentID != id || loc.Offset != sc.Offset {

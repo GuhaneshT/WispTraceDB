@@ -21,12 +21,12 @@ import (
 )
 
 const (
-	defaultWALPath          = "wal.log"
+	defaultWALPath           = "wal.log"
 	defaultWALMaxSegmentSize = wal.DefaultMaxSegmentSize
-	defaultPebblePath       = "wisp_lsm"
-	defaultSegmentDir       = "segments"
-	defaultCheckpointPath   = "checkpoint.dat"
-	defaultManifestPath     = "manifest.dat"
+	defaultPebblePath        = "wisp_lsm"
+	defaultSegmentDir        = "segments"
+	defaultCheckpointPath    = "checkpoint.dat"
+	defaultManifestPath      = "manifest.dat"
 
 	defaultSegmentFlushThreshold      = 1000
 	defaultCompactionSegmentThreshold = 10
@@ -41,29 +41,28 @@ const (
 )
 
 type WispTraceConfig struct {
-	WALPath                     string
-	WALMaxSegmentSize           uint64
-	PebblePath                  string
-	SegmentDir                  string
-	CheckpointPath              string
-	ManifestPath                string
-	SegmentFlushThreshold       int
-	CompactionSegmentThreshold  int
-	RollupSnapshotInterval      time.Duration
-	CompactionInterval          time.Duration
-	RetentionPeriod             time.Duration
-	SessionTimeout              time.Duration
+	WALPath                    string
+	WALMaxSegmentSize          uint64
+	PebblePath                 string
+	SegmentDir                 string
+	CheckpointPath             string
+	ManifestPath               string
+	SegmentFlushThreshold      int
+	CompactionSegmentThreshold int
+	RollupSnapshotInterval     time.Duration
+	CompactionInterval         time.Duration
+	RetentionPeriod            time.Duration
+	SessionTimeout             time.Duration
 }
 
 type traceState struct {
 	spans    []wal.SpanPayload
-	lastSeen int64 
+	lastSeen int64
 }
 
 type WispTrace struct {
 	config WispTraceConfig
 
-	
 	wal        *wal.WAL
 	index      *pebble.DB
 	checkpoint *Checkpoint
@@ -80,7 +79,7 @@ type WispTrace struct {
 	ingestWg   sync.WaitGroup
 	ingestWgMu sync.Mutex // serializes ingestWg.Add against ingestWg.Wait — see WaitForIngest
 
-	// Session buffering 
+	// Session buffering
 	sessionMu        sync.Mutex
 	sessionBuffer    map[string]*traceState
 	sessionSpanCount int
@@ -134,18 +133,42 @@ func DefaultWispTraceConfig() WispTraceConfig {
 
 func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 	// Apply defaults for any zero values
-	if config.WALPath == "" { config.WALPath = defaultWALPath }
-	if config.WALMaxSegmentSize == 0 { config.WALMaxSegmentSize = defaultWALMaxSegmentSize }
-	if config.PebblePath == "" { config.PebblePath = defaultPebblePath }
-	if config.SegmentDir == "" { config.SegmentDir = defaultSegmentDir }
-	if config.CheckpointPath == "" { config.CheckpointPath = defaultCheckpointPath }
-	if config.ManifestPath == "" { config.ManifestPath = defaultManifestPath }
-	if config.SegmentFlushThreshold == 0 { config.SegmentFlushThreshold = defaultSegmentFlushThreshold }
-	if config.CompactionSegmentThreshold == 0 { config.CompactionSegmentThreshold = defaultCompactionSegmentThreshold }
-	if config.RollupSnapshotInterval == 0 { config.RollupSnapshotInterval = defaultRollupSnapshotInterval }
-	if config.CompactionInterval == 0 { config.CompactionInterval = defaultCompactionInterval }
-	if config.RetentionPeriod == 0 { config.RetentionPeriod = defaultRetentionPeriod }
-	if config.SessionTimeout == 0 { config.SessionTimeout = defaultSessionTimeout }
+	if config.WALPath == "" {
+		config.WALPath = defaultWALPath
+	}
+	if config.WALMaxSegmentSize == 0 {
+		config.WALMaxSegmentSize = defaultWALMaxSegmentSize
+	}
+	if config.PebblePath == "" {
+		config.PebblePath = defaultPebblePath
+	}
+	if config.SegmentDir == "" {
+		config.SegmentDir = defaultSegmentDir
+	}
+	if config.CheckpointPath == "" {
+		config.CheckpointPath = defaultCheckpointPath
+	}
+	if config.ManifestPath == "" {
+		config.ManifestPath = defaultManifestPath
+	}
+	if config.SegmentFlushThreshold == 0 {
+		config.SegmentFlushThreshold = defaultSegmentFlushThreshold
+	}
+	if config.CompactionSegmentThreshold == 0 {
+		config.CompactionSegmentThreshold = defaultCompactionSegmentThreshold
+	}
+	if config.RollupSnapshotInterval == 0 {
+		config.RollupSnapshotInterval = defaultRollupSnapshotInterval
+	}
+	if config.CompactionInterval == 0 {
+		config.CompactionInterval = defaultCompactionInterval
+	}
+	if config.RetentionPeriod == 0 {
+		config.RetentionPeriod = defaultRetentionPeriod
+	}
+	if config.SessionTimeout == 0 {
+		config.SessionTimeout = defaultSessionTimeout
+	}
 
 	if err := os.MkdirAll(config.SegmentDir, 0755); err != nil {
 		return nil, fmt.Errorf("create segment dir: %w", err)
@@ -496,7 +519,20 @@ func (w *WispTrace) processSpan(span wal.SpanPayload) {
 	// Feed Rollups. Cost must go through rollup.ScaleCost — span.Cost is a
 	// float64 dollar amount (almost always < $1 for a single LLM span), and
 	// a bare int64(span.Cost) truncates it to zero.
-	w.rollups.Add(span.Timestamp, span.Model, rollup.ScaleCost(span.Cost), int64(span.TokensIn), int64(span.TokensOut), span.LatencyMs)
+	//
+	// A tombstone contributes nothing. The rollup stores are purely additive
+	// (Count++, SumCost += cost) and have no decrement path anywhere in the
+	// package, so counting a deleted span would inflate every aggregate for
+	// the lifetime of the window. This closes the case where a span is
+	// tombstoned before it is counted; a span that was already counted and is
+	// deleted later still keeps its contribution, because reversing it is an
+	// exact operation for Count/SumCost/SumTokens but NOT for MinLatencyMs /
+	// MaxLatencyMs — un-minimising those needs a per-bucket latency
+	// distribution the store does not keep. That residual leak is tracked as
+	// an open design question rather than assumed away here.
+	if !span.Deleted {
+		w.rollups.Add(span.Timestamp, span.Model, rollup.ScaleCost(span.Cost), int64(span.TokensIn), int64(span.TokensOut), span.LatencyMs)
+	}
 
 	// Feed Session Buffer
 	w.sessionMu.Lock()
@@ -508,7 +544,7 @@ func (w *WispTrace) processSpan(span wal.SpanPayload) {
 	state.spans = append(state.spans, span)
 	state.lastSeen = time.Now().UnixNano()
 	w.sessionSpanCount++
-	
+
 	needsFlush := w.sessionSpanCount >= w.config.SegmentFlushThreshold
 	w.sessionMu.Unlock()
 
@@ -584,8 +620,77 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) 
 		return fmt.Errorf("rotate wal: %w", err)
 	}
 
+	// Collapse duplicate keys within this batch down to their LAST write.
+	//
+	// A span inserted and then deleted before a flush lands arrives here
+	// twice. Writing both records into one segment would leave a superseded
+	// live copy sitting beside its own tombstone, and RangeQuery — which walks
+	// segments and never consults the index, filtering only on Deleted — would
+	// happily return the dead copy. It would also make the segment carry two
+	// records for one key, which the index can only point at one of.
+	//
+	// Order is preserved by first appearance, so the resulting record sequence
+	// matches the input's shape; only the content per key is collapsed.
+	latestAt := make(map[string]int, len(spans))
+	order := make([]string, 0, len(spans))
+	for i, span := range spans {
+		key := segment.CompositeKey(span.TraceID, span.SpanID)
+		if _, seen := latestAt[key]; !seen {
+			order = append(order, key)
+		}
+		latestAt[key] = i
+	}
+	deduped := make([]wal.SpanPayload, 0, len(order))
+	for _, key := range order {
+		deduped = append(deduped, spans[latestAt[key]])
+	}
+
+	// Split into records to persist and tombstone keys to remove. A
+	// tombstone's only durable effect is the index delete; it never needs a
+	// record in a segment.
+	liveSpans := make([]wal.SpanPayload, 0, len(deduped))
+	var tombstoneKeys []string
+	for _, span := range deduped {
+		if span.Deleted {
+			tombstoneKeys = append(tombstoneKeys, segment.CompositeKey(span.TraceID, span.SpanID))
+			continue
+		}
+		liveSpans = append(liveSpans, span)
+	}
+
+	// Tombstone-only batch: write no segment at all.
+	//
+	// A segment of nothing but tombstones carries no index entries, so startup
+	// reconciliation — which derives the manifest from ScanAll — would drop it
+	// from the manifest on the next open, leaving a file on disk that no
+	// manifest references and compaction therefore never reclaims. Consuming a
+	// segment id for it and adding it to the manifest here would just create
+	// that divergence deliberately. The index deletes are the whole effect.
+	//
+	// WAL reclamation and the rollup snapshot still have to run, otherwise a
+	// delete-heavy workload would grow the WAL forever.
+	if len(liveSpans) == 0 {
+		if err := w.index.BatchApplySpans(nil, tombstoneKeys); err != nil {
+			return fmt.Errorf("apply %d tombstone(s) to index: %w", len(tombstoneKeys), err)
+		}
+		if err := w.flushRollups(); err != nil {
+			return fmt.Errorf("snapshot rollups: %w", err)
+		}
+		// Same one-flush-lag reclamation discipline as the segment path below,
+		// and it has to run here too: a delete-only workload appends to the WAL
+		// but never writes a segment, so deferring this to "the next flush"
+		// would mean it never runs and the WAL grows without bound.
+		if w.walReclaimBelow > 0 {
+			if err := w.wal.RemoveSegmentsUpTo(w.walReclaimBelow - 1); err != nil {
+				return fmt.Errorf("reclaim wal segments up to %d: %w", w.walReclaimBelow-1, err)
+			}
+		}
+		w.walReclaimBelow = drainWAL
+		return nil
+	}
+
 	writer := segment.NewWriter()
-	for _, span := range spans {
+	for _, span := range liveSpans {
 		writer.Add(span)
 	}
 
@@ -594,11 +699,22 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) 
 		return fmt.Errorf("write segment %d: %w", w.nextSegmentID, err)
 	}
 
+	// Index the segment's live records and remove this batch's tombstones in a
+	// single atomic batch. Committing them separately would open a window in
+	// which a tombstoned key still resolved to its pre-delete record. The key
+	// was deleted from the index here rather than being repointed at the
+	// tombstone, so a deleted span is unreachable from the index — it stays
+	// readable only if a reader ignores the index, which is why RangeQuery's
+	// segment walk and the GetSpan/GetTrace read paths all filter Deleted as
+	// defence in depth.
 	entries := make(map[string]pebble.SpanLocation, len(result.Offsets))
-	for key, offset := range result.Offsets {
-		entries[key] = pebble.SpanLocation{SegmentID: result.SegmentID, Offset: offset}
+	for _, span := range liveSpans {
+		key := segment.CompositeKey(span.TraceID, span.SpanID)
+		if offset, ok := result.Offsets[key]; ok {
+			entries[key] = pebble.SpanLocation{SegmentID: result.SegmentID, Offset: offset}
+		}
 	}
-	if err := w.index.BatchPutSpans(entries); err != nil {
+	if err := w.index.BatchApplySpans(entries, tombstoneKeys); err != nil {
 		return fmt.Errorf("index segment %d: %w", result.SegmentID, err)
 	}
 
@@ -781,19 +897,74 @@ func (w *WispTrace) Compactor() *compactor.Compactor {
 	return compactor.New(w.config.SegmentDir, w.manifest, w.index)
 }
 
-// GetSpan looks up one span by trace_id+span_id
-func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found bool, err error) {
-	// First check memory buffer (hot path spans not yet in segment)
+// bufferedSpan reports the authoritative state of spanID in the session buffer.
+//
+// The third return distinguishes "the buffer has an answer" from "the buffer has
+// nothing for this key", which is what lets GetSpan treat a buffered tombstone
+// as a final answer instead of falling through to the index and reading the
+// pre-delete record out of a segment.
+func (w *WispTrace) bufferedSpan(traceID, spanID string) (span wal.SpanPayload, found, resolved bool) {
 	w.sessionMu.Lock()
-	if state, ok := w.sessionBuffer[traceID]; ok {
+	defer w.sessionMu.Unlock()
+
+	state, ok := w.sessionBuffer[traceID]
+	if !ok {
+		return wal.SpanPayload{}, false, false
+	}
+	// Scan backwards: the buffer is append-only, so the last entry for a span
+	// id is the most recent write and therefore the authoritative one. Taking
+	// the first match instead would resurrect a stale copy when the same span is
+	// written twice before a flush.
+	for i := len(state.spans) - 1; i >= 0; i-- {
+		if state.spans[i].SpanID != spanID {
+			continue
+		}
+		if state.spans[i].Deleted {
+			return wal.SpanPayload{}, false, true
+		}
+		return state.spans[i], true, true
+	}
+	return wal.SpanPayload{}, false, false
+}
+
+// bufferedSpansByKey snapshots the session buffer as composite key → last write,
+// plus the key order so callers can produce deterministic results. The buffer is
+// append-only, so the last entry for a key is the authoritative one and an
+// earlier copy is stale by construction.
+//
+// Pass an empty traceID to snapshot every buffered trace. The lock is released
+// before returning, so callers must not hold it and can do segment I/O on the
+// result without blocking ingest.
+func (w *WispTrace) bufferedSpansByKey(traceID string) (map[string]wal.SpanPayload, []string) {
+	w.sessionMu.Lock()
+	defer w.sessionMu.Unlock()
+
+	byKey := make(map[string]wal.SpanPayload)
+	order := make([]string, 0)
+	for id, state := range w.sessionBuffer {
+		if traceID != "" && id != traceID {
+			continue
+		}
 		for _, s := range state.spans {
-			if s.SpanID == spanID && !s.Deleted {
-				w.sessionMu.Unlock()
-				return s, true, nil
+			key := segment.CompositeKey(s.TraceID, s.SpanID)
+			if _, seen := byKey[key]; !seen {
+				order = append(order, key)
 			}
+			byKey[key] = s
 		}
 	}
-	w.sessionMu.Unlock()
+	return byKey, order
+}
+
+// GetSpan looks up one span by trace_id+span_id. A tombstoned span is
+// reported as not found — the same answer RangeQuery gives — so the read APIs
+// agree on whether a deleted span exists.
+func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found bool, err error) {
+	// A span still in the session buffer has not reached a segment, and a
+	// buffered tombstone has not yet deleted the index entry for the older copy.
+	if s, f, resolved := w.bufferedSpan(traceID, spanID); resolved {
+		return s, f, nil
+	}
 
 	key := []byte(segment.CompositeKey(traceID, spanID))
 	location, err := w.index.GetSpan(key)
@@ -814,19 +985,37 @@ func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found
 	if err != nil {
 		return wal.SpanPayload{}, false, fmt.Errorf("read span at segment %d offset %d: %w", location.SegmentID, location.Offset, err)
 	}
+	// Defence in depth. writeSegmentBatch deletes tombstoned keys from the
+	// index rather than pointing them at their record, so a tombstone should
+	// be unreachable here. Segments written before that fix can still hold
+	// indexed tombstones, and a record may have been replaced at the same
+	// offset, so check the flag rather than trusting the index.
+	if span.Deleted {
+		return wal.SpanPayload{}, false, nil
+	}
 	return span, true, nil
 }
 
-// GetTrace reconstructs a full trace by ID
+// GetTrace reconstructs a full trace by ID. Tombstoned spans are excluded, so
+// a trace consisting only of deleted spans reports not found — consistent with
+// GetSpan and RangeQuery.
+//
+// A buffered write takes precedence over the index. The index holds exactly one
+// location per key, so a tombstone that has not been flushed yet has not
+// deleted the entry pointing at the pre-delete record; without this the trace
+// path would resurrect the span for the whole flush interval even though
+// GetSpan correctly reports it gone.
 func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
+	buffered, bufferedOrder := w.bufferedSpansByKey(traceID)
+
 	prefix := []byte(segment.CompositeKey(traceID, ""))
 	locations, err := w.index.PrefixScan(prefix)
 	if err != nil {
 		return nil, false, fmt.Errorf("index prefix scan: %w", err)
 	}
-	
-	spans := make([]wal.SpanPayload, 0, len(locations))
-	
+
+	spans := make([]wal.SpanPayload, 0, len(locations)+len(bufferedOrder))
+
 	if len(locations) > 0 {
 		readers := make(map[uint64]*segment.Reader)
 		defer func() {
@@ -849,16 +1038,32 @@ func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
 			if err != nil {
 				return nil, false, fmt.Errorf("read span at segment %d offset %d: %w", loc.SegmentID, loc.Offset, err)
 			}
+			// A buffered write for this key is newer than the record the index
+			// points at, so the index copy is superseded — including when the
+			// buffered write is the tombstone that will delete it.
+			if _, pending := buffered[segment.CompositeKey(span.TraceID, span.SpanID)]; pending {
+				continue
+			}
+			// Defence in depth, same as GetSpan: tombstones are deleted from
+			// the index at flush time, so one showing up here means a segment
+			// written before that fix.
+			if span.Deleted {
+				continue
+			}
 			spans = append(spans, span)
 		}
 	}
 
-	// Add any spans still in memory buffer
-	w.sessionMu.Lock()
-	if state, ok := w.sessionBuffer[traceID]; ok {
-		spans = append(spans, state.spans...)
+	// Buffered spans for this trace. bufferedSpansByKey already collapsed each
+	// key to its last write, so a live copy superseded by a tombstone is simply
+	// not present here.
+	for _, key := range bufferedOrder {
+		s := buffered[key]
+		if s.Deleted {
+			continue
+		}
+		spans = append(spans, s)
 	}
-	w.sessionMu.Unlock()
 
 	if len(spans) == 0 {
 		return nil, false, nil
@@ -869,7 +1074,7 @@ func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
 // RangeFilter selects spans by time range and, optionally, bounded-cardinality
 // dimension values. An empty string on any dimension field means "don't filter".
 type RangeFilter struct {
-	StartTS, EndTS                        int64
+	StartTS, EndTS                         int64
 	AgentID, Model, ToolName, Team, Status string
 }
 
@@ -912,7 +1117,7 @@ func (f RangeFilter) mayMatchBlooms(blooms map[string]*bloom.Filter) bool {
 		}
 		filter, ok := blooms[c.dim]
 		if !ok {
-			continue 
+			continue
 		}
 		if !filter.MayContain(c.value) {
 			return false
@@ -921,12 +1126,36 @@ func (f RangeFilter) mayMatchBlooms(blooms map[string]*bloom.Filter) bool {
 	return true
 }
 
-// RangeQuery returns every live span matching filter
+// RangeQuery returns every live span matching filter.
+//
+// A segment record is a CANDIDATE, not an answer. Segments are immutable, so a
+// span deleted after its segment was written is still physically present in that
+// segment, and the deletion exists only in the index — a negative fact that a
+// segment walk cannot see. Bloom and zone-map pruning narrow the candidate set
+// but say nothing about liveness.
+//
+// So every candidate is re-verified against the index before it is returned:
+// the same staleness check the compactor applies, and the same rule as
+// invariant 5, "the index entry is the authority on liveness". A record is
+// emitted only if the index points at exactly this (segment_id, offset). A
+// tombstoned key has no entry at all, and a key rewritten since this segment
+// was written points somewhere else; both are superseded.
+//
+// This costs one index lookup per candidate and is a real regression against
+// the previous index-free scan. It is the price of not returning deleted spans
+// from the query path, and the obvious optimisation — one snapshot iterator
+// instead of N point lookups — is deliberately not taken here.
 func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 	live, err := w.manifest.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load manifest: %w", err)
 	}
+
+	// Snapshot the session buffer up front. Its records are strictly newer than
+	// anything in a segment — they have not been flushed yet — so a buffered
+	// version of a key supersedes the segment's copy, and a buffered tombstone
+	// must suppress it.
+	buffered, bufferedOrder := w.bufferedSpansByKey("")
 
 	var results []wal.SpanPayload
 	for _, id := range live {
@@ -955,7 +1184,18 @@ func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 		}
 
 		for _, s := range spans {
+			// Defence in depth: a tombstone is no longer written to a segment
+			// at all, so this can only fire on a segment predating that change.
 			if s.Span.Deleted {
+				continue
+			}
+			key := segment.CompositeKey(s.Span.TraceID, s.Span.SpanID)
+			if _, pending := buffered[key]; pending {
+				continue
+			}
+			// Staleness check — see the doc comment.
+			loc, err := w.index.GetSpan([]byte(key))
+			if err != nil || loc.SegmentID != id || loc.Offset != s.Offset {
 				continue
 			}
 			if filter.matches(s.Span) {
@@ -964,16 +1204,15 @@ func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 		}
 	}
 
-	// Add in-memory spans that match
-	w.sessionMu.Lock()
-	for _, state := range w.sessionBuffer {
-		for _, s := range state.spans {
-			if !s.Deleted && filter.matches(s) {
-				results = append(results, s)
-			}
+	// Buffered spans not yet in any segment. Last write per key already won
+	// above, so a live copy superseded by a tombstone is simply not there.
+	for _, key := range bufferedOrder {
+		s := buffered[key]
+		if s.Deleted || !filter.matches(s) {
+			continue
 		}
+		results = append(results, s)
 	}
-	w.sessionMu.Unlock()
 
 	return results, nil
 }
