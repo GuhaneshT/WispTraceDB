@@ -144,6 +144,87 @@ func BenchmarkGetTrace(b *testing.B) {
 	}
 }
 
+// BenchmarkRangeQueryWithCompaction measures the query path once the live
+// segment count has exceeded CompactionSegmentThreshold and the inline
+// compaction in writeSegmentBatch has merged the oldest half of the live
+// segments. Unlike BenchmarkRangeQuery it exercises the post-merge segment set
+// and the per-candidate staleness check (one index.GetSpan per surviving
+// candidate) on merged segments that each hold many more records.
+func BenchmarkRangeQueryWithCompaction(b *testing.B) {
+	wt, err := CreateWispTraceWithConfig(benchConfig(b))
+	if err != nil {
+		b.Fatalf("create wt: %v", err)
+	}
+	defer wt.Close()
+
+	// SegmentFlushThreshold=1000, so numSpans/1000 segments are produced and
+	// default CompactionSegmentThreshold=10 means compaction triggers inline
+	// during the flushes that push the live set past 10.
+	const numSpans = 15000
+	for i := 0; i < numSpans; i++ {
+		// Unique trace id per span, exactly like BenchmarkRangeQuery: sharing a
+		// trace id (e.g. i%500) with a fixed span id would make every write for
+		// a composite key supersede the previous, so writeSegmentBatch's
+		// last-write-wins dedupe would leave only 500 live keys and the scan
+		// would measure a stale-supersede workload rather than a range scan.
+		span := generateBenchSpan(fmt.Sprintf("trace-%d", i), "span-1", int64(i*10))
+		if err := wt.InsertSpan(span); err != nil {
+			b.Fatalf("insert error: %v", err)
+		}
+	}
+	if err := wt.Flush(); err != nil {
+		b.Fatalf("flush error: %v", err)
+	}
+	wt.WaitForIngest()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		startTS := int64((i * 10) % 140000)
+		filter := RangeFilter{StartTS: startTS, EndTS: startTS + 1000}
+		_, err := wt.RangeQuery(filter)
+		if err != nil {
+			b.Fatalf("range query error: %v", err)
+		}
+	}
+}
+
+// BenchmarkGetSpanWithCompaction measures a point lookup against the same
+// post-compaction state as BenchmarkRangeQueryWithCompaction, so the cost of
+// reading a record out of a large merged segment is visible separately from
+// the scan path.
+func BenchmarkGetSpanWithCompaction(b *testing.B) {
+	wt, err := CreateWispTraceWithConfig(benchConfig(b))
+	if err != nil {
+		b.Fatalf("create wt: %v", err)
+	}
+	defer wt.Close()
+
+	const numSpans = 15000
+	for i := 0; i < numSpans; i++ {
+		span := generateBenchSpan(fmt.Sprintf("trace-%d", i), "span-1", int64(i*10))
+		if err := wt.InsertSpan(span); err != nil {
+			b.Fatalf("insert error: %v", err)
+		}
+	}
+	if err := wt.Flush(); err != nil {
+		b.Fatalf("flush error: %v", err)
+	}
+	wt.WaitForIngest()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		traceID := fmt.Sprintf("trace-%d", i%numSpans)
+		_, found, err := wt.GetSpan(traceID, "span-1")
+		if err != nil || !found {
+			b.Fatalf("get error: %v, found: %v", err, found)
+		}
+	}
+}
+
 func BenchmarkRangeQuery(b *testing.B) {
 	wt, err := CreateWispTraceWithConfig(benchConfig(b))
 	if err != nil {
