@@ -40,6 +40,31 @@ func OpenReader(path string) (*Reader, error) {
 	return &Reader{file: file, Header: header, Blooms: blooms}, nil
 }
 
+// OpenReaderLight opens a segment for exact-offset reads without decoding its
+// bloom section. Blooms exist only for RangeQuery's segment pruning; a caller
+// that already holds an exact (segment_id, offset) from the index — GetSpan,
+// GetTrace, spanAlreadyIndexed — consults none of them, so decoding them here
+// is pure waste. The waste scales with the segment's span count: a 5000-span
+// segment carries a ~30 KB bloom section versus ~6 KB for a 1000-span one, and
+// that cost was landing on every point lookup.
+//
+// The returned reader has Blooms == nil. Callers that need bloom pruning must
+// use OpenReader instead.
+func OpenReaderLight(path string) (*Reader, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	header, err := readHeader(file)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("read segment header: %w", err)
+	}
+
+	return &Reader{file: file, Header: header}, nil
+}
+
 // Close releases the underlying file handle.
 func (r *Reader) Close() error {
 	return r.file.Close()

@@ -975,7 +975,10 @@ func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found
 		return wal.SpanPayload{}, false, fmt.Errorf("index lookup: %w", err)
 	}
 
-	reader, err := segment.OpenReader(segment.SegmentPath(w.config.SegmentDir, location.SegmentID))
+	// Point lookup from an exact (segment_id, offset): the bloom section is
+	// irrelevant here and decoding it dominated the per-lookup cost, so open
+	// without it.
+	reader, err := segment.OpenReaderLight(segment.SegmentPath(w.config.SegmentDir, location.SegmentID))
 	if err != nil {
 		return wal.SpanPayload{}, false, fmt.Errorf("open segment %d: %w", location.SegmentID, err)
 	}
