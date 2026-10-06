@@ -321,6 +321,16 @@ var recordBufPool = sync.Pool{
 
 // Append record to the active WAL segment, rotating first if it would overflow.
 func (w *WAL) AppendRecord(record WALRecord) error {
+	_, err := w.AppendRecordWithSeg(record)
+	return err
+}
+
+// AppendRecordWithSeg appends a record and returns the id of the WAL segment
+// that now holds it. The caller needs this to know which segments still contain
+// records that have not yet been folded into a segment: reclamation may only
+// delete segments strictly below the lowest such id, and that cannot be derived
+// from the segment that happens to be active at flush time.
+func (w *WAL) AppendRecordWithSeg(record WALRecord) (uint64, error) {
 	recordSize := recordHeaderSize + payloadEncodedSize(record)
 
 	bufPtr := recordBufPool.Get().(*[]byte)
@@ -343,23 +353,26 @@ func (w *WAL) AppendRecord(record WALRecord) error {
 	defer w.mu.Unlock()
 
 	if w.file == nil {
-		return fmt.Errorf("wal is closed")
+		return 0, fmt.Errorf("wal is closed")
 	}
 
 	// size > 0 keeps a single oversized record from rotating forever; it gets
 	// a segment to itself instead.
 	if w.size > 0 && w.size+uint64(recordSize) > w.maxSegmentSize {
 		if _, err := w.rotateLocked(); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
 	n, err := w.file.Write(buf)
 	w.size += uint64(n)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return w.file.Sync()
+	if err := w.file.Sync(); err != nil {
+		return 0, err
+	}
+	return w.segmentID, nil
 }
 
 // Rotate seals the active segment and starts a new one. It returns the id of

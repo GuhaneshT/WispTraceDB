@@ -158,6 +158,64 @@ func TestWALRotateSealsCurrentSegment(t *testing.T) {
 	assertReplay(t, w, []wal.WALRecord{first, second})
 }
 
+// AppendRecordWithSeg must report the segment that actually holds the record.
+// The engine derives its WAL reclamation bound from this id, so an id that is
+// off by one in the permissive direction deletes the only durable copy of an
+// acknowledged span, and one in the other direction leaks the WAL forever. There
+// is no other way to observe which segment a record landed in, so this is the
+// contract that has to be pinned here.
+func TestWALAppendRecordWithSegReportsTheSegmentHoldingTheRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+
+	// Default segment size: these records are far below it, so nothing rotates
+	// on size and every reported id must be the single active segment.
+	w, err := wal.CreateWAL(path)
+	if err != nil {
+		t.Fatalf("CreateWAL() error = %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	want := makeRecords(3)
+	reported := make([]uint64, 0, len(want))
+	for _, record := range want {
+		id, err := w.AppendRecordWithSeg(record)
+		if err != nil {
+			t.Fatalf("AppendRecordWithSeg() error = %v", err)
+		}
+		reported = append(reported, id)
+		if id != w.CurrentSegment() {
+			t.Fatalf("AppendRecordWithSeg() reported segment %d, want the active segment %d", id, w.CurrentSegment())
+		}
+	}
+
+	sealed, err := w.Rotate()
+	if err != nil {
+		t.Fatalf("Rotate() error = %v", err)
+	}
+	if sealed != reported[0] {
+		t.Fatalf("Rotate() sealed = %d, want the segment reported by the appends (%d)", sealed, reported[0])
+	}
+
+	// Reclaiming strictly below the reported id must keep every record.
+	if err := w.RemoveSegmentsUpTo(reported[0] - 1); err != nil {
+		t.Fatalf("RemoveSegmentsUpTo() error = %v", err)
+	}
+	assertReplay(t, w, want)
+
+	// Reaching the reported id must remove them, which is only true if that id
+	// named the segment holding them.
+	if err := w.RemoveSegmentsUpTo(reported[len(reported)-1]); err != nil {
+		t.Fatalf("RemoveSegmentsUpTo() error = %v", err)
+	}
+	got, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Replay() returned %d records after reclaiming the segment the appends reported", len(got))
+	}
+}
+
 func TestWALRemoveSegmentsUpToKeepsActiveAndLaterSegments(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wal.log")
 

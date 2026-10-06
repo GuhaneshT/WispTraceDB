@@ -733,6 +733,160 @@ func TestPointLookupThroughSegmentReader(t *testing.T) {
 	}
 }
 
+// The reclaimable-WAL bound must be derived from what is still un-flushed, not
+// predicted from which segment happened to be active during a flush's drain.
+//
+// A span is acknowledged the moment its WAL record is fsynced, which is BEFORE
+// it is enqueued for the ingest loop. A producer descheduled in that window has
+// an acknowledged span whose only durable copy sits in a sealed WAL segment that
+// no flush has covered. The previous bound (the previous flush's drain segment,
+// minus one) deleted exactly that segment, and the loss only became visible
+// after a crash — which is what TestFaultInjectionAckedSpansSurviveKills
+// reported intermittently, and only under a loaded machine where flushes are
+// slow enough to land inside the window.
+//
+// appendTracked reproduces the window without depending on scheduler timing:
+// it performs the fsync and the registration but stops short of the enqueue.
+func TestFlushedBatchDoesNotReclaimStillUnflushedAckedRecord(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1 // flush on every processed span
+
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+
+	// One ordinary insert so the engine has a live segment, an active WAL
+	// segment, and a reclamation history at all.
+	if err := wt.InsertSpan(testSpan("t1", "s-prime", 100)); err != nil {
+		t.Fatalf("InsertSpan(prime) error = %v", err)
+	}
+	wt.WaitForIngest()
+
+	// The acknowledged-but-not-yet-enqueued span.
+	pending := testSpan("t1", "s-pending", 110)
+	segID, err := wt.appendTracked(pending)
+	if err != nil {
+		t.Fatalf("appendTracked() error = %v", err)
+	}
+
+	// Filler inserts, each of which flushes and therefore reclaims. Two are
+	// enough for the old bound to walk past segID.
+	for i := 0; i < 3; i++ {
+		span := testSpan("t1", fmt.Sprintf("s-filler-%d", i), int64(200+i))
+		if err := wt.InsertSpan(span); err != nil {
+			t.Fatalf("InsertSpan(filler %d) error = %v", i, err)
+		}
+		wt.WaitForIngest()
+	}
+
+	// The segment holding the acknowledged record must still be on disk.
+	segs, err := wt.wal.Segments()
+	if err != nil {
+		t.Fatalf("wal.Segments() error = %v", err)
+	}
+	stillThere := false
+	for _, id := range segs {
+		if id == segID {
+			stillThere = true
+		}
+	}
+	if !stillThere {
+		t.Fatalf("WAL segment %d holding the acknowledged unflushed span was reclaimed; surviving segments = %v", segID, segs)
+	}
+
+	// And the span must come back from the WAL after a crash.
+	crashClose(t, wt)
+
+	wt2, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() after crash error = %v", err)
+	}
+	defer wt2.Close()
+
+	got, found, err := wt2.GetSpan("t1", "s-pending")
+	if err != nil {
+		t.Fatalf("GetSpan(s-pending) error = %v", err)
+	}
+	if !found {
+		t.Fatalf("acknowledged span s-pending was lost across the crash: it was fsynced before any flush covered it")
+	}
+	if got.SpanID != "s-pending" || got.Timestamp != pending.Timestamp {
+		t.Fatalf("GetSpan(s-pending) = %+v, want %+v", got, pending)
+	}
+}
+
+// A flush that drains only some sessions (the expired-sessions path) is still a
+// flush: it rotates the WAL and reclaims. It must not treat the spans it left
+// buffered as durable. The old bound advanced on every flush, so the retained
+// records were deleted two flushes later — while still only in the session
+// buffer — and a crash in that window lost them.
+//
+// Expiry is forced by ageing lastSeen directly rather than by sleeping, so the
+// test cannot go vacuous on a slow machine.
+func TestPartialFlushDoesNotReclaimStillBufferedRecord(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SegmentFlushThreshold = 1 << 30 // no inline threshold flushes
+
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+
+	// "keep" is never aged out, so it stays buffered across every flush below.
+	keep := testSpan("keep", "s-keep", 100)
+	if err := wt.InsertSpan(keep); err != nil {
+		t.Fatalf("InsertSpan(keep) error = %v", err)
+	}
+	wt.WaitForIngest()
+
+	ageAllBut := func(traceID string) {
+		wt.sessionMu.Lock()
+		defer wt.sessionMu.Unlock()
+		stale := time.Now().Add(-time.Hour).UnixNano()
+		for id, state := range wt.sessionBuffer {
+			if id != traceID {
+				state.lastSeen = stale
+			}
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		span := testSpan("exp", fmt.Sprintf("s-exp-%d", i), int64(200+i))
+		if err := wt.InsertSpan(span); err != nil {
+			t.Fatalf("InsertSpan(exp %d) error = %v", i, err)
+		}
+		wt.WaitForIngest()
+
+		ageAllBut("keep")
+		wt.flushExpiredSessions()
+	}
+
+	// "keep" is still only in the session buffer and in the WAL.
+	if _, err := wt.index.GetSpan([]byte(segment.CompositeKey("keep", "s-keep"))); err == nil {
+		t.Fatalf("s-keep should not be indexed yet: it was never drained by an expired-sessions flush")
+	}
+
+	crashClose(t, wt)
+
+	wt2, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() after crash error = %v", err)
+	}
+	defer wt2.Close()
+
+	got, found, err := wt2.GetSpan("keep", "s-keep")
+	if err != nil {
+		t.Fatalf("GetSpan(s-keep) error = %v", err)
+	}
+	if !found {
+		t.Fatal("span buffered behind partial flushes was lost across the crash")
+	}
+	if got.SpanID != "s-keep" || got.Timestamp != keep.Timestamp {
+		t.Fatalf("GetSpan(s-keep) = %+v, want %+v", got, keep)
+	}
+}
+
 func TestSegmentIDsSurviveRestartAfterCompaction(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.SegmentFlushThreshold = 3 // drive flushes explicitly, not at threshold

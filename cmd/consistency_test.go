@@ -157,9 +157,10 @@ func TestCheckConsistencyDetectsMissingSegmentFile(t *testing.T) {
 func TestCheckConsistencyDetectsCorruptSegmentRecord(t *testing.T) {
 	cfg := testConfig(t)
 	// Defaults: 3 spans per flush, compaction threshold 10. Nine spans produce
-	// three segments and no compaction. The flush after the next reclaims each
-	// flush's WAL segment, so by Close() only the last flush's records remain
-	// in the tail — segment 1's WAL records are already reclaimed.
+	// three segments and no compaction. Each flush reclaims its own WAL
+	// segments as soon as the batch is durable, so by Close() the WAL holds
+	// nothing but an empty active segment and segment 1's records cannot be
+	// re-flushed from the tail — the CRC failure has to surface.
 	wt, err := CreateWispTraceWithConfig(cfg)
 	if err != nil {
 		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)

@@ -55,8 +55,19 @@ type WispTraceConfig struct {
 	SessionTimeout             time.Duration
 }
 
+// pendingSpan is an acknowledged span travelling from the WAL to a segment. It
+// carries the WAL segment holding its record, which is the only other place
+// that copy exists until the flush commits.
+//
+// walSeg is 0 for a span replayed out of the WAL during recovery: that copy is
+// already on disk by definition and was never registered in the pending set.
+type pendingSpan struct {
+	span   wal.SpanPayload
+	walSeg uint64
+}
+
 type traceState struct {
-	spans    []wal.SpanPayload
+	spans    []pendingSpan
 	lastSeen int64
 }
 
@@ -75,7 +86,7 @@ type WispTrace struct {
 	bgWg   sync.WaitGroup
 
 	// Hotpath ingestion
-	ingestChan chan wal.SpanPayload
+	ingestChan chan pendingSpan
 	ingestWg   sync.WaitGroup
 	ingestWgMu sync.Mutex // serializes ingestWg.Add against ingestWg.Wait — see WaitForIngest
 
@@ -90,24 +101,26 @@ type WispTrace struct {
 
 	// recovering forces processSpan to skip its inline threshold flush (and
 	// maybeCompactLocked to skip compaction) while a crash-recovery replay is
-	// in flight. Recovery must drain the whole WAL tail into a single final
-	// segment and must not reclaim any WAL segment along the way: a crash
-	// inside a recovery that already reclaimed a rotated segment would make
-	// the un-reclaimed part of the tail permanently lost, even though the
-	// spans were acknowledged.
+	// in flight. Recovery drains the whole WAL tail into a single final
+	// segment, so the only flush that can run during recovery already covers
+	// every record the WAL still holds; splitting that drain would let one
+	// flush reclaim WAL the next one has not rewritten yet.
 	recovering bool
 
-	// walReclaimBelow is the id of the oldest sealed WAL segment that must be
-	// kept on disk: it is the segment that was CURRENT when the previous
-	// flush snapshotted its drain, so it may still hold records that
-	// InsertSpan has already appended and fsynced (an ack returns
-	// synchronously after the WAL write) but that the async ingest loop has
-	// not yet drained. Reclaiming it now would lose acknowledged spans on the
-	// very next crash. Only segments STRICTLY below it are reclaimed; every
-	// record below was enqueued before that drain's snapshot and, being part
-	// of the FIFO processed prefix, was provably sealed into the previous
-	// flush's checkpointed segment. See writeSegmentBatch.
-	walReclaimBelow uint64
+	// walPending counts, per WAL segment id, the records that have been
+	// fsynced (so acknowledged) but are not yet durable in a segment or
+	// applied to the index. A WAL segment may be deleted only once nothing
+	// pending references it, which makes "lowest pending id" the exact
+	// reclamation bound — no prediction about which flush covered which
+	// record, and no assumption that the WAL, the ingest channel and the
+	// session buffer advance in lockstep.
+	//
+	// walPendingMu is held across the WAL append itself (see
+	// appendTracked) and across the flush path's reclamation
+	// (releaseWALPending), so "append and register" and "compute bound and
+	// delete" can never interleave.
+	walPendingMu sync.Mutex
+	walPending   map[uint64]int
 }
 
 func CreateWisp() (*WispTrace, error) {
@@ -204,8 +217,9 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 		rollups:       rollup.NewRollupManager(),
 		ctx:           ctx,
 		cancel:        cancel,
-		ingestChan:    make(chan wal.SpanPayload, 10000), // Buffer for bursty ingest
+		ingestChan:    make(chan pendingSpan, 10000), // Buffer for bursty ingest
 		sessionBuffer: make(map[string]*traceState),
+		walPending:    make(map[uint64]int),
 	}
 
 	// Segment IDs are seeded from on-disk truth, not the checkpoint alone:
@@ -341,7 +355,7 @@ func (w *WispTrace) recover() error {
 		if w.spanAlreadyIndexed(record.Span) {
 			continue
 		}
-		w.processSpan(record.Span)
+		w.processSpan(pendingSpan{span: record.Span})
 	}
 	w.recovering = false
 
@@ -459,8 +473,10 @@ func segmentSetEqual(a, b []uint64) bool {
 }
 
 func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
-	// 1. Durability: Appends are fsynced by the WAL
-	if err := w.wal.AppendRecord(wal.WALRecord{Span: span}); err != nil {
+	// 1. Durability: the append is fsynced by the WAL, and the record is
+	//    registered as not-yet-durable in the same critical section.
+	segID, err := w.appendTracked(span)
+	if err != nil {
 		return fmt.Errorf("wal append: %w", err)
 	}
 
@@ -472,7 +488,7 @@ func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
 	w.ingestWgMu.Unlock()
 
 	select {
-	case w.ingestChan <- span:
+	case w.ingestChan <- pendingSpan{span: span, walSeg: segID}:
 	case <-w.ctx.Done():
 		w.ingestWg.Done()
 		return fmt.Errorf("db closed")
@@ -481,14 +497,44 @@ func (w *WispTrace) InsertSpan(span wal.SpanPayload) error {
 	return nil
 }
 
+// appendTracked fsyncs a span's WAL record and marks the segment that received
+// it as holding a record which is not yet durable anywhere else.
+//
+// The lock is deliberately held across the append, not just around the
+// bookkeeping that follows it. Registering afterwards leaves a window — append
+// returns, record fsynced, span acknowledged to the caller, registration not
+// yet done — in which a concurrent flush sees a pending set that omits this
+// record, concludes the segment can be deleted, and deletes the only other
+// durable copy of an acknowledged span. That is the failure the fault-injection
+// harness reports, and it needs no bad luck beyond a flush running in that
+// window.
+//
+// The cost is that record encoding (which wal.AppendRecordWithSeg deliberately
+// does outside its own lock) is no longer concurrent. Appends themselves were
+// already serialised by the WAL — write plus fsync under one lock — so the
+// fsync, which is what the benchmark actually measures, is unaffected. A future
+// group-commit append should register its whole batch under a single hold, which
+// keeps the same ordering guarantee while amortising the fsync.
+func (w *WispTrace) appendTracked(span wal.SpanPayload) (uint64, error) {
+	w.walPendingMu.Lock()
+	defer w.walPendingMu.Unlock()
+
+	segID, err := w.wal.AppendRecordWithSeg(wal.WALRecord{Span: span})
+	if err != nil {
+		return 0, err
+	}
+	w.walPending[segID]++
+	return segID, nil
+}
+
 func (w *WispTrace) ingestLoop() {
 	defer w.bgWg.Done()
 	for {
 		select {
 		case <-w.ctx.Done():
 			return
-		case span := <-w.ingestChan:
-			w.processSpan(span)
+		case ps := <-w.ingestChan:
+			w.processSpan(ps)
 			w.ingestWg.Done()
 		}
 	}
@@ -515,7 +561,9 @@ func (w *WispTrace) WaitForIngest() *WispTrace {
 	return w
 }
 
-func (w *WispTrace) processSpan(span wal.SpanPayload) {
+func (w *WispTrace) processSpan(ps pendingSpan) {
+	span := ps.span
+
 	// Feed Rollups. Cost must go through rollup.ScaleCost — span.Cost is a
 	// float64 dollar amount (almost always < $1 for a single LLM span), and
 	// a bare int64(span.Cost) truncates it to zero.
@@ -534,14 +582,15 @@ func (w *WispTrace) processSpan(span wal.SpanPayload) {
 		w.rollups.Add(span.Timestamp, span.Model, rollup.ScaleCost(span.Cost), int64(span.TokensIn), int64(span.TokensOut), span.LatencyMs)
 	}
 
-	// Feed Session Buffer
+	// Feed Session Buffer. The WAL segment id rides along so the flush that
+	// eventually persists this span can release exactly its record.
 	w.sessionMu.Lock()
 	state, ok := w.sessionBuffer[span.TraceID]
 	if !ok {
-		state = &traceState{spans: make([]wal.SpanPayload, 0, 8)}
+		state = &traceState{spans: make([]pendingSpan, 0, 8)}
 		w.sessionBuffer[span.TraceID] = state
 	}
-	state.spans = append(state.spans, span)
+	state.spans = append(state.spans, ps)
 	state.lastSeen = time.Now().UnixNano()
 	w.sessionSpanCount++
 
@@ -572,12 +621,9 @@ func (w *WispTrace) flushExpiredSessions() {
 	now := time.Now().UnixNano()
 	timeoutNs := w.config.SessionTimeout.Nanoseconds()
 
-	var toFlush []wal.SpanPayload
+	var toFlush []pendingSpan
 
 	w.sessionMu.Lock()
-	// Capture the WAL segment active during this drain snapshot: the entry
-	// below writeSegmentBatch uses it to decide what may safely be reclaimed.
-	drainWAL := w.wal.CurrentSegment()
 	for traceID, state := range w.sessionBuffer {
 		if now-state.lastSeen > timeoutNs {
 			toFlush = append(toFlush, state.spans...)
@@ -588,16 +634,13 @@ func (w *WispTrace) flushExpiredSessions() {
 	w.sessionMu.Unlock()
 
 	if len(toFlush) > 0 {
-		_ = w.writeSegmentBatch(toFlush, drainWAL)
+		_ = w.writeSegmentBatch(toFlush)
 	}
 }
 
 func (w *WispTrace) flushAllSessions() error {
-	var toFlush []wal.SpanPayload
+	var toFlush []pendingSpan
 	w.sessionMu.Lock()
-	// Capture the WAL segment active during this drain snapshot: the entry
-	// below writeSegmentBatch uses it to decide what may safely be reclaimed.
-	drainWAL := w.wal.CurrentSegment()
 	for traceID, state := range w.sessionBuffer {
 		toFlush = append(toFlush, state.spans...)
 		delete(w.sessionBuffer, traceID)
@@ -606,12 +649,12 @@ func (w *WispTrace) flushAllSessions() error {
 	w.sessionMu.Unlock()
 
 	if len(toFlush) > 0 {
-		return w.writeSegmentBatch(toFlush, drainWAL)
+		return w.writeSegmentBatch(toFlush)
 	}
 	return nil
 }
 
-func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) error {
+func (w *WispTrace) writeSegmentBatch(spans []pendingSpan) error {
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
 
@@ -634,13 +677,13 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) 
 	latestAt := make(map[string]int, len(spans))
 	order := make([]string, 0, len(spans))
 	for i, span := range spans {
-		key := segment.CompositeKey(span.TraceID, span.SpanID)
+		key := segment.CompositeKey(span.span.TraceID, span.span.SpanID)
 		if _, seen := latestAt[key]; !seen {
 			order = append(order, key)
 		}
 		latestAt[key] = i
 	}
-	deduped := make([]wal.SpanPayload, 0, len(order))
+	deduped := make([]pendingSpan, 0, len(order))
 	for _, key := range order {
 		deduped = append(deduped, spans[latestAt[key]])
 	}
@@ -650,7 +693,8 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) 
 	// record in a segment.
 	liveSpans := make([]wal.SpanPayload, 0, len(deduped))
 	var tombstoneKeys []string
-	for _, span := range deduped {
+	for _, ps := range deduped {
+		span := ps.span
 		if span.Deleted {
 			tombstoneKeys = append(tombstoneKeys, segment.CompositeKey(span.TraceID, span.SpanID))
 			continue
@@ -667,8 +711,9 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) 
 	// segment id for it and adding it to the manifest here would just create
 	// that divergence deliberately. The index deletes are the whole effect.
 	//
-	// WAL reclamation and the rollup snapshot still have to run, otherwise a
-	// delete-heavy workload would grow the WAL forever.
+	// Releasing the WAL records still has to run here, otherwise a
+	// delete-heavy workload would append to the WAL, never write a segment, and
+	// so never drop a pending record — the WAL would grow without bound.
 	if len(liveSpans) == 0 {
 		if err := w.index.BatchApplySpans(nil, tombstoneKeys); err != nil {
 			return fmt.Errorf("apply %d tombstone(s) to index: %w", len(tombstoneKeys), err)
@@ -676,17 +721,7 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) 
 		if err := w.flushRollups(); err != nil {
 			return fmt.Errorf("snapshot rollups: %w", err)
 		}
-		// Same one-flush-lag reclamation discipline as the segment path below,
-		// and it has to run here too: a delete-only workload appends to the WAL
-		// but never writes a segment, so deferring this to "the next flush"
-		// would mean it never runs and the WAL grows without bound.
-		if w.walReclaimBelow > 0 {
-			if err := w.wal.RemoveSegmentsUpTo(w.walReclaimBelow - 1); err != nil {
-				return fmt.Errorf("reclaim wal segments up to %d: %w", w.walReclaimBelow-1, err)
-			}
-		}
-		w.walReclaimBelow = drainWAL
-		return nil
+		return w.releaseWALPending(spans)
 	}
 
 	writer := segment.NewWriter()
@@ -727,31 +762,24 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) 
 	}
 
 	// Snapshot rollups at the same cadence as the checkpoint (PAD1 v1.1),
-	// and — critically — before the WAL segments below are reclaimed. The
+	// and — critically — before this batch's WAL records are released. The
 	// independent rollupSnapshotLoop ticker is a periodic backstop, not the
 	// primary guarantee: it can lag behind how fast segments flush, and WAL
-	// pruning is driven by the checkpoint here, not by that ticker. Without
-	// this call, data ingested between two rollup-ticker snapshots but
-	// already checkpointed into a segment would be unrecoverable for
-	// rollups after a crash — recover() only replays the WAL tail, and by
-	// then RemoveSegmentsUpTo would have already deleted it.
+	// reclamation runs at the end of this function, not on that ticker. Without
+	// this call, data ingested between two rollup-ticker snapshots but already
+	// durable in a segment would be unrecoverable for rollups after a crash —
+	// recover() only replays the WAL tail, and by then releaseWALPending would
+	// have already deleted it.
 	if err := w.flushRollups(); err != nil {
 		return fmt.Errorf("snapshot rollups at segment %d: %w", result.SegmentID, err)
 	}
 
-	if w.walReclaimBelow > 0 {
-		if err := w.wal.RemoveSegmentsUpTo(w.walReclaimBelow - 1); err != nil {
-			return fmt.Errorf("reclaim wal segments up to %d: %w", w.walReclaimBelow-1, err)
-		}
+	// Only now — segment written, index batch committed, manifest updated,
+	// checkpoint saved — are this batch's WAL records redundant. Release them
+	// and reclaim whatever the WAL can provably spare.
+	if err := w.releaseWALPending(spans); err != nil {
+		return err
 	}
-	// The segment active during THIS flush's drain (captured by the caller
-	// as drainWAL, and now sealed by the Rotate above) stays on disk: it can
-	// still hold spans that were already appended and acknowledged while the
-	// ingest loop was busy draining/flushing, and deleting them would lose
-	// acknowledged spans on the very next crash. The next flush proves every
-	// record below it was part of this drain's FIFO processed prefix and
-	// reclaims them then.
-	w.walReclaimBelow = drainWAL
 
 	w.nextSegmentID++
 
@@ -763,6 +791,80 @@ func (w *WispTrace) writeSegmentBatch(spans []wal.SpanPayload, drainWAL uint64) 
 	// work has no place on the ingest flush path.
 	w.maybeCompactLocked()
 
+	return nil
+}
+
+// releaseWALPending marks a committed batch's WAL records as redundant and
+// deletes the WAL segments that provably hold nothing else.
+//
+// The rule: a WAL segment is deletable exactly when no pending record lives in
+// it, because "pending" means "acknowledged but not yet durable in a segment or
+// applied to the index". So the reclamation bound is the lowest pending segment
+// id, and everything strictly below it is safe by construction.
+//
+// The bound this replaces — the WAL segment active during the previous flush's
+// drain, minus one — was a prediction rather than a fact. It was only correct if
+// every record below that segment had provably been part of that drain's FIFO
+// processed prefix, and that is false in three ordinary situations:
+//
+//   - a span that was fsynced and acknowledged but is still sitting in the
+//     ingest channel when the flush snapshots (InsertSpan's append returns
+//     before the enqueue, so a producer preempted in that window is acked
+//     while its record is already in a sealed segment);
+//   - a partial flush, where flushExpiredSessions writes only the expired
+//     sessions and leaves the rest buffered while still advancing the bound;
+//   - a tombstone-only batch, which advances the bound without writing a
+//     segment.
+//
+// Any of those deletes the only other copy of an acknowledged span, and the
+// loss only shows up after a crash — which is why the fault-injection harness,
+// not any unit test, is what catches it.
+//
+// Caller must hold flushMu, so no two batches race to reclaim.
+func (w *WispTrace) releaseWALPending(batch []pendingSpan) error {
+	w.walPendingMu.Lock()
+
+	for _, ps := range batch {
+		if ps.walSeg == 0 {
+			// Replayed out of the WAL at startup: on disk already, never
+			// registered as pending.
+			continue
+		}
+		if w.walPending[ps.walSeg] <= 1 {
+			delete(w.walPending, ps.walSeg)
+		} else {
+			w.walPending[ps.walSeg]--
+		}
+	}
+
+	lowest := uint64(0)
+	found := false
+	for segID := range w.walPending {
+		if !found || segID < lowest {
+			lowest, found = segID, true
+		}
+	}
+
+	var bound uint64
+	if found {
+		// Everything strictly below the oldest un-flushed record is durable.
+		bound = lowest - 1
+	} else {
+		// Nothing acknowledged is un-flushed, so every sealed segment is fully
+		// covered. active-1 leaves the segment currently being appended to
+		// alone (RemoveSegmentsUpTo would skip it regardless).
+		active := w.wal.CurrentSegment()
+		if active <= 1 {
+			w.walPendingMu.Unlock()
+			return nil
+		}
+		bound = active - 1
+	}
+	w.walPendingMu.Unlock()
+
+	if err := w.wal.RemoveSegmentsUpTo(bound); err != nil {
+		return fmt.Errorf("reclaim wal segments up to %d: %w", bound, err)
+	}
 	return nil
 }
 
@@ -916,13 +1018,13 @@ func (w *WispTrace) bufferedSpan(traceID, spanID string) (span wal.SpanPayload, 
 	// the first match instead would resurrect a stale copy when the same span is
 	// written twice before a flush.
 	for i := len(state.spans) - 1; i >= 0; i-- {
-		if state.spans[i].SpanID != spanID {
+		if state.spans[i].span.SpanID != spanID {
 			continue
 		}
-		if state.spans[i].Deleted {
+		if state.spans[i].span.Deleted {
 			return wal.SpanPayload{}, false, true
 		}
-		return state.spans[i], true, true
+		return state.spans[i].span, true, true
 	}
 	return wal.SpanPayload{}, false, false
 }
@@ -945,13 +1047,13 @@ func (w *WispTrace) bufferedSpansByKey(traceID string) (map[string]wal.SpanPaylo
 		if traceID != "" && id != traceID {
 			continue
 		}
-		for _, s := range state.spans {
-			key := segment.CompositeKey(s.TraceID, s.SpanID)
-			if _, seen := byKey[key]; !seen {
-				order = append(order, key)
-			}
-			byKey[key] = s
+for _, ps := range state.spans {
+		key := segment.CompositeKey(ps.span.TraceID, ps.span.SpanID)
+		if _, seen := byKey[key]; !seen {
+			order = append(order, key)
 		}
+		byKey[key] = ps.span
+	}
 	}
 	return byKey, order
 }
@@ -975,9 +1077,6 @@ func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found
 		return wal.SpanPayload{}, false, fmt.Errorf("index lookup: %w", err)
 	}
 
-	// Point lookup from an exact (segment_id, offset): the bloom section is
-	// irrelevant here and decoding it dominated the per-lookup cost, so open
-	// without it.
 	reader, err := segment.OpenReaderLight(segment.SegmentPath(w.config.SegmentDir, location.SegmentID))
 	if err != nil {
 		return wal.SpanPayload{}, false, fmt.Errorf("open segment %d: %w", location.SegmentID, err)
@@ -1196,14 +1295,17 @@ func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 			if _, pending := buffered[key]; pending {
 				continue
 			}
-			// Staleness check — see the doc comment.
+			if !filter.matches(s.Span) {
+				continue
+			}
+			// Staleness check — see the doc comment. Run after the cheap
+			// in-memory filter to avoid an index lookup for every scanned
+			// record when only a small time window matches.
 			loc, err := w.index.GetSpan([]byte(key))
 			if err != nil || loc.SegmentID != id || loc.Offset != s.Offset {
 				continue
 			}
-			if filter.matches(s.Span) {
-				results = append(results, s.Span)
-			}
+			results = append(results, s.Span)
 		}
 	}
 
