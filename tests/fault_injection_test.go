@@ -28,6 +28,17 @@ import (
 //   - recovered data is consistent (CheckConsistency passes);
 //   - no span is duplicated and none appear that were never written.
 //
+// Every run prints a `verdict:` line carrying all of those counts. A test that
+// only reports on failure proves its claims with an exit code, which is not
+// evidence a reader can check; the numbers have to be output.
+//
+// A kill timing is only meaningful if the kill lands on a live process. The
+// worker therefore holds open after its own flush when a kill is expected
+// (faultHoldEnv), and the driver fails if the worker exited by itself: a
+// workload that finishes before the kill would run the graceful-close path a
+// second time, the verdict would still be clean (a closed database has nothing
+// wrong with it), and the case would quietly stop testing a crash.
+//
 // The ack oracle is a plain file OUTSIDE the db dir. The worker records seq
 // only after InsertSpan returns (i.e. after the WAL fsync). The OS page cache
 // survives a process kill, so oracle-listed spans are a sound lower bound for
@@ -41,6 +52,7 @@ const (
 	faultDirEnv    = "WISPTRACE_FAULT_DIR"
 	faultOracleEnv = "WISPTRACE_FAULT_ORACLE"
 	faultMaxEnv    = "WISPTRACE_FAULT_MAX"
+	faultHoldEnv   = "WISPTRACE_FAULT_HOLD"
 
 	faultTraces        = 50
 	faultTombstoneEach = 17
@@ -93,6 +105,19 @@ func TestFaultWorker(t *testing.T) {
 	if err := wt.Flush(); err != nil {
 		t.Fatalf("final flush: %v", err)
 	}
+
+	// A worker that exits by itself turns a kill timing into a clean
+	// shutdown. Nothing is wrong with a cleanly closed database, so the
+	// verdict still passes — and the case silently stops testing a crash,
+	// which is exactly how "cool" came to be reported as a steady-state kill
+	// when it was running the graceful-close path a second time. When the
+	// driver asked for a kill, hold here instead of closing, so that kill
+	// always lands on a live process; the driver asserts the worker did not
+	// exit on its own.
+	if os.Getenv(faultHoldEnv) == "1" {
+		<-make(chan struct{})
+	}
+
 	if err := wt.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -123,6 +148,11 @@ func faultTestConfig(dir string) cmd.WispTraceConfig {
 	if os.Getenv("WISPTRACE_FAULT_NOCOMPACT") == "1" {
 		cfg.SegmentFlushThreshold = 1 << 30
 		cfg.CompactionSegmentThreshold = 1 << 30
+		// Without this the "never flushed" premise dies quietly: the expiry
+		// ticker fires every second and sessions older than the 5s default
+		// get flushed mid-run on a slow machine, folding everything into a
+		// segment long before the kill.
+		cfg.SessionTimeout = 24 * time.Hour
 	}
 	return cfg
 }
@@ -157,7 +187,14 @@ func TestFaultInjectionAckedSpansSurviveKills(t *testing.T) {
 	}{
 		{"graceful-close", 0, 400},
 		{"hot", 30 * time.Millisecond, 800},
-		{"mid", 300 * time.Millisecond, 800},
+		// mid's max is far larger than its kill window needs: the worker must
+		// still be mid-insert when the kill lands, on any machine. With max=800
+		// the workload finished in ~570ms against a 300ms kill — a margin that
+		// load can eat, turning the case into a flushed-and-held steady state.
+		{"mid", 300 * time.Millisecond, 4000},
+		// cool is the opposite: it deliberately lets the workload finish and
+		// flush (with the hold guard the kill then lands on the live, flushed
+		// process), so max stays small.
 		{"cool", 1300 * time.Millisecond, 800},
 	}
 	if testing.Short() {
@@ -171,7 +208,35 @@ func TestFaultInjectionAckedSpansSurviveKills(t *testing.T) {
 	}
 }
 
+// TestFaultInjectionReplayRecoversUnflushedAcks pins the recovery path that the
+// four kill timings reach only by accident of timing.
+//
+// "hot" leaves every acked record in the tail today, but only because the kill
+// happens to land before the first flush — and reclamation is now derived from
+// records still unflushed, so any run that reaches the worker's own final flush
+// (never mind one that closes) leaves an empty tail and makes Replay() a
+// legitimate no-op. "Does Replay() rebuild an entire acknowledged workload" was
+// therefore pinned nowhere: it depended on machine speed.
+//
+// This case removes the flush from the picture instead of retuning a sleep:
+// thresholds and session expiry are neutralised, so nothing is ever folded into
+// a segment, and the whole acknowledged set must come back through Replay()
+// alone. The kill is 30ms after the first ack — deliberately inside the ingest
+// stream, because a longer window lets the workload finish and reach the
+// worker's own flush. requireFullTail then checks the claim at the WAL level,
+// before recovery is allowed to run: the frozen tail is non-empty and
+// physically contains every acked record.
+func TestFaultInjectionReplayRecoversUnflushedAcks(t *testing.T) {
+	t.Setenv("WISPTRACE_FAULT_NOCOMPACT", "1")
+	runFaultCycleExpecting(t, 30*time.Millisecond, 800, true)
+}
+
 func runFaultCycle(t *testing.T, killAfter time.Duration, max int) {
+	t.Helper()
+	runFaultCycleExpecting(t, killAfter, max, false)
+}
+
+func runFaultCycleExpecting(t *testing.T, killAfter time.Duration, max int, requireFullTail bool) {
 	t.Helper()
 	base := t.TempDir()
 	dbDir := filepath.Join(base, "db")
@@ -185,12 +250,22 @@ func runFaultCycle(t *testing.T, killAfter time.Duration, max int) {
 		faultOracleEnv+"="+oraclePath,
 		faultMaxEnv+"="+strconv.Itoa(max),
 	)
+	// With a kill asked for, the worker holds open after its own flush instead
+	// of exiting, so the kill always lands on a live process.
+	if killAfter > 0 {
+		workerCmd.Env = append(workerCmd.Env, faultHoldEnv+"=1")
+	}
 	workerCmd.Stdout = io.Discard
 	workerCmd.Stderr = io.Discard
 
 	if err := workerCmd.Start(); err != nil {
 		t.Fatalf("start worker: %v", err)
 	}
+	t.Cleanup(func() {
+		if workerCmd.Process != nil && workerCmd.ProcessState == nil {
+			_ = workerCmd.Process.Kill()
+		}
+	})
 
 	if killAfter <= 0 {
 		if err := workerCmd.Wait(); err != nil {
@@ -214,7 +289,9 @@ func runFaultCycle(t *testing.T, killAfter time.Duration, max int) {
 		}
 		time.Sleep(killAfter)
 		_ = workerCmd.Process.Kill()
-		_ = workerCmd.Wait()
+		if waitErr := workerCmd.Wait(); waitErr == nil {
+			t.Fatalf("worker exited on its own before killAfter=%v: this timing exercised a clean shutdown instead of a crash, so the verdict would pass while testing nothing", killAfter)
+		}
 	}
 
 	// Freeze the on-disk state exactly as the crash left it, so a later
@@ -222,27 +299,35 @@ func runFaultCycle(t *testing.T, killAfter time.Duration, max int) {
 	postcrash := filepath.Join(base, "postcrash")
 	diskCopy(t, dbDir, postcrash)
 
-	verifyAfterCrash(t, cfg, readOracle(oraclePath), max, postcrash)
+	verifyAfterCrash(t, cfg, readOracle(oraclePath), max, postcrash, requireFullTail)
 }
 
-func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, max int, postcrash string) {
+func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, max int, postcrash string, requireFullTail bool) {
 	t.Helper()
 	acked := ackSet(oracle)
 	if len(acked) == 0 {
 		t.Fatal("no acked spans recorded — harness degenerate")
+	}
+	ackedTombstones := 0
+	for seq := range acked {
+		if seq%faultTombstoneEach == 0 {
+			ackedTombstones++
+		}
 	}
 
 	// The killed process releases its handles asynchronously on Windows;
 	// brief retry lets the reopen compete with handle teardown.
 	var wt *cmd.WispTrace
 	var err error
+	reopenAttempt := 0
 	for i := 0; i < 30; i++ {
+		reopenAttempt = i + 1
 		wt, err = cmd.CreateWispTraceWithConfig(cfg)
 		if err == nil {
-			t.Logf("reopen succeeded on attempt %d", i+1)
+			t.Logf("reopen succeeded on attempt %d", reopenAttempt)
 			break
 		}
-		t.Logf("reopen attempt %d failed: %v", i+1, err)
+		t.Logf("reopen attempt %d failed: %v", reopenAttempt, err)
 		time.Sleep(100 * time.Millisecond)
 	}
 	if err != nil {
@@ -287,7 +372,55 @@ func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, ma
 		}
 	}
 	t.Logf("--- frozen post-crash WAL tail (what reopen's Replay() sees) ---")
-	dumpWALSnapshot(t, faultTestConfig(postcrash))
+	walTail, tailSeqs := dumpWALSnapshot(t, faultTestConfig(postcrash))
+
+	// 2. Exactly-once visibility and no phantoms. Collected rather than
+	// asserted on first contact, so the verdict below reports every count on
+	// a passing run instead of reporting nothing.
+	all, err := wt.RangeQuery(cmd.RangeFilter{StartTS: 0, EndTS: 1<<63 - 1})
+	if err != nil {
+		t.Fatalf("RangeQuery() = %v", err)
+	}
+	live := make(map[int]int)
+	var phantoms []int
+	for _, s := range all {
+		seq, perr := strconv.Atoi(string(s.Payload))
+		if perr != nil {
+			t.Fatalf("unrecognizable payload %q in range results", s.Payload)
+		}
+		if seq < 0 || seq >= max {
+			phantoms = append(phantoms, seq)
+			continue
+		}
+		live[seq]++
+	}
+	var duplicates []int
+	var notInRange []int
+	for seq := range acked {
+		if seq%faultTombstoneEach == 0 {
+			continue
+		}
+		switch n := live[seq]; {
+		case n > 1:
+			duplicates = append(duplicates, seq)
+		case n == 0:
+			notInRange = append(notInRange, seq)
+		}
+	}
+	var ackedNotInTail []int
+	for seq := range acked {
+		if !tailSeqs[seq] {
+			ackedNotInTail = append(ackedNotInTail, seq)
+		}
+	}
+
+	// The verdict is the point of the harness: a passing run has to print its
+	// evidence, because "it exited 0" is not evidence a reader can check.
+	// fmt.Printf rather than t.Logf — a log line only surfaces under -v.
+	fmt.Printf("verdict: acked=%d tombstones=%d missing=%d duplicates=%d not-in-range=%d phantoms=%d "+
+		"range=%d warnings=%d reopen-attempt=%d wal-tail=%d acked-not-in-tail=%d\n",
+		len(acked), ackedTombstones, len(missing), len(duplicates), len(notInRange), len(phantoms),
+		len(all), len(rep.Warnings), reopenAttempt, walTail, len(ackedNotInTail))
 
 	if len(missing) > 0 {
 		t.Logf("acked=%d first=%d last=%d missing=%d",
@@ -299,29 +432,21 @@ func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, ma
 		dumpDiskState(t, faultTestConfig(postcrash))
 		t.Fatalf("%d acked spans lost after crash", len(missing))
 	}
-
-	// 2. Exactly-once visibility and no phantoms.
-	all, err := wt.RangeQuery(cmd.RangeFilter{StartTS: 0, EndTS: 1<<63 - 1})
-	if err != nil {
-		t.Fatalf("RangeQuery() = %v", err)
+	if len(duplicates) > 0 {
+		t.Fatalf("live acked spans appeared more than once in RangeQuery: %v", duplicates)
 	}
-	live := make(map[int]int)
-	for _, s := range all {
-		seq, perr := strconv.Atoi(string(s.Payload))
-		if perr != nil {
-			t.Fatalf("unrecognizable payload %q in range results", s.Payload)
-		}
-		if seq < 0 || seq >= max {
-			t.Fatalf("phantom span %d outside the written workload", seq)
-		}
-		live[seq]++
+	if len(notInRange) > 0 {
+		t.Fatalf("live acked spans absent from RangeQuery: %v", notInRange)
 	}
-	for seq := range acked {
-		if seq%faultTombstoneEach == 0 {
-			continue
+	if len(phantoms) > 0 {
+		t.Fatalf("phantom spans outside the written workload: %v", phantoms)
+	}
+	if requireFullTail {
+		if walTail == 0 {
+			t.Fatal("no-flush run left an empty WAL tail: Replay() had nothing to do, so this case tested nothing")
 		}
-		if n := live[seq]; n != 1 {
-			t.Fatalf("live acked span %d appeared %d times in RangeQuery, want exactly 1", seq, n)
+		if len(ackedNotInTail) > 0 {
+			t.Fatalf("%d acked records are absent from the frozen WAL tail: %v", len(ackedNotInTail), ackedNotInTail)
 		}
 	}
 }
@@ -393,12 +518,18 @@ func diskCopy(t *testing.T, src, dst string) {
 	}
 }
 
-// dumpWALSnapshot opens cfg's WAL on a frost-copied directory (never the live
-// db) and replays it, so the harness can report exactly which acked spans the
-// crash left durable in the WAL tail. The WAL is opened as its own engine
+// dumpWALSnapshot opens cfg's WAL on a frozen copy of the directory (never the
+// live db) and replays it, so the harness can report exactly which acked spans
+// the crash left durable in the WAL tail. The WAL is opened as its own engine
 // would, so torn-tail truncation, if any, happens on the copy only.
-func dumpWALSnapshot(t *testing.T, cfg cmd.WispTraceConfig) {
+//
+// It returns the record count and the set of payload sequence numbers found, so
+// callers can assert coverage rather than eyeball a log line: the no-flush case
+// checks that every acked record is physically present in this tail before
+// recovery gets the chance to rebuild it.
+func dumpWALSnapshot(t *testing.T, cfg cmd.WispTraceConfig) (int, map[int]bool) {
 	t.Helper()
+	found := make(map[int]bool)
 	maxSeg := cfg.WALMaxSegmentSize
 	if maxSeg == 0 {
 		maxSeg = wal.DefaultMaxSegmentSize
@@ -406,27 +537,29 @@ func dumpWALSnapshot(t *testing.T, cfg cmd.WispTraceConfig) {
 	w, err := wal.CreateWALWithSegmentSize(cfg.WALPath, maxSeg)
 	if err != nil {
 		t.Logf("  wal open: %v", err)
-		return
+		return 0, found
 	}
 	defer w.Close()
 	recs, err := w.Replay()
 	if err != nil {
 		t.Logf("  wal replay error: %v", err)
-		return
+		return 0, found
 	}
 	var seqs []int64
 	for _, r := range recs {
 		if n, perr := strconv.ParseInt(string(r.Span.Payload), 10, 64); perr == nil {
+			found[int(n)] = true
 			seqs = append(seqs, n)
 		}
 	}
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 	if len(seqs) == 0 {
 		t.Logf("  (empty WAL tail)")
-		return
+		return 0, found
 	}
 	t.Logf("  %d records, seq range [%d..%d]", len(seqs), seqs[0], seqs[len(seqs)-1])
 	t.Logf("  seqs: %v", seqs)
+	return len(seqs), found
 }
 
 // dumpDiskState prints every sequence found in any segment_*.seg file on

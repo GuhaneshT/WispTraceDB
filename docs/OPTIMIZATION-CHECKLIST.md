@@ -18,10 +18,11 @@ each phase.
 ## Phase 1: Point-lookup read path (Priority #1) — Reduce GetSpan overhead
 - [x] segment: Add `OpenReaderLight(path string)` that reads the header only (no bloom decode). `Blooms` stays nil. — `segment/reader.go`
 - [x] `cmd/GetSpan`: use `OpenReaderLight` instead of `OpenReader` — `cmd/cmd.go:981`
-- [x] Apply light path in `spanAlreadyIndexed` (recovery path) — uses ReadAt only
-- [x] Apply light path in `GetTrace` when reading specific offsets — uses ReadAt only; full reader still used where blooms needed for other paths? GetTrace reads exact offsets via cached readers and never consults reader.Blooms, so light path is fine.
+- [ ] Apply light path in `spanAlreadyIndexed` (recovery path) — reverted, not measured
+- [ ] Apply light path in `GetTrace` when reading specific offsets — reverted, not measured. GetTrace reads exact offsets through cached readers and never consults `reader.Blooms`, so this is still a legitimate win; it needs its own benchmark before it is claimed.
 - [ ] Verify no behavior change: existing tests pass (GetSpan returns correct spans, tombstones filtered, GetTrace correctness)
 - [x] Benchmark GetSpan vs baseline; record improvement — `docs/benchmarks/post-p1-20261003.txt` (GetSpanWithCompaction B/op -97.5%, ns/op -43%)
+- [x] Measure the `RangeQuery` filter-before-index reorder — `docs/benchmarks/range-reorder-20261003.txt`
 
 ## Phase 2: Segment FD/cache (Priority #2) — Avoid reopen churn
 - [ ] Design: LRU cache keyed by segment ID (or path). Stores opened reader (header + blooms, or light). Concurrency-safe (RWMutex) with eviction.
