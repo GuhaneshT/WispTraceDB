@@ -225,6 +225,41 @@ func BenchmarkGetSpanWithCompaction(b *testing.B) {
 	}
 }
 
+// BenchmarkSpanAlreadyIndexed measures the per-record recovery dedupe check:
+// index lookup + segment open + exact-offset read, for a record the index
+// already resolves. This runs once per WAL record replayed past the
+// checkpoint, so its per-open overhead is restart time.
+func BenchmarkSpanAlreadyIndexed(b *testing.B) {
+	wt, err := CreateWispTraceWithConfig(benchConfig(b))
+	if err != nil {
+		b.Fatalf("create wt: %v", err)
+	}
+	defer wt.Close()
+
+	const numSpans = 5000
+	spans := make([]wal.SpanPayload, numSpans)
+	for i := 0; i < numSpans; i++ {
+		span := generateBenchSpan("trace-idx", fmt.Sprintf("span-%d", i), int64(i))
+		spans[i] = span
+		if err := wt.InsertSpan(span); err != nil {
+			b.Fatalf("insert error: %v", err)
+		}
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		b.Fatalf("flush error: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		if !wt.spanAlreadyIndexed(spans[i%numSpans]) {
+			b.Fatalf("spanAlreadyIndexed(%s) = false, want true", spans[i%numSpans].SpanID)
+		}
+	}
+}
+
 func BenchmarkRangeQuery(b *testing.B) {
 	wt, err := CreateWispTraceWithConfig(benchConfig(b))
 	if err != nil {

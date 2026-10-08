@@ -388,7 +388,7 @@ func (w *WispTrace) spanAlreadyIndexed(span wal.SpanPayload) bool {
 		return false
 	}
 
-	reader, err := segment.OpenReader(segment.SegmentPath(w.config.SegmentDir, loc.SegmentID))
+	reader, err := segment.OpenReaderLight(segment.SegmentPath(w.config.SegmentDir, loc.SegmentID))
 	if err != nil {
 		return false
 	}
@@ -1129,7 +1129,7 @@ func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
 		for _, loc := range locations {
 			reader, ok := readers[loc.SegmentID]
 			if !ok {
-				reader, err = segment.OpenReader(segment.SegmentPath(w.config.SegmentDir, loc.SegmentID))
+				reader, err = segment.OpenReaderLight(segment.SegmentPath(w.config.SegmentDir, loc.SegmentID))
 				if err != nil {
 					return nil, false, fmt.Errorf("open segment %d: %w", loc.SegmentID, err)
 				}
