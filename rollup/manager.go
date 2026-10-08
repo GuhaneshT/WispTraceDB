@@ -12,7 +12,6 @@ const (
 	WindowDay     = "1d"
 )
 
-
 const (
 	WindowSizeMinute  int64 = 60 * 1_000_000_000
 	WindowSizeFiveMin int64 = 5 * 60 * 1_000_000_000
@@ -41,7 +40,6 @@ func ScaleCost(dollars float64) int64 {
 func UnscaleCost(scaled int64) float64 {
 	return float64(scaled) / CostScale
 }
-
 
 type RollupManager struct {
 	Minute  *Store // 1-minute buckets

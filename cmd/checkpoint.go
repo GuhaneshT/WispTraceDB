@@ -7,16 +7,14 @@ import (
 )
 
 // Checkpoint persists the id of the last segment for which both the segment
-// file and its Pebble index entries are confirmed 
+// file and its Pebble index entries are confirmed
 type Checkpoint struct {
 	path string
 }
 
-
 func NewCheckpoint(path string) *Checkpoint {
 	return &Checkpoint{path: path}
 }
-
 
 func (c *Checkpoint) Load() (uint64, error) {
 	data, err := os.ReadFile(c.path)
@@ -31,7 +29,6 @@ func (c *Checkpoint) Load() (uint64, error) {
 	}
 	return binary.LittleEndian.Uint64(data), nil
 }
-
 
 func (c *Checkpoint) Save(segmentID uint64) error {
 	tmp := c.path + ".tmp"

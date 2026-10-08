@@ -94,7 +94,6 @@ func (m *Manifest) AddSegment(id uint64) error {
 	return m.Save(append(ids, id))
 }
 
-
 func RemoveSegments(ids []uint64, remove []uint64) []uint64 {
 	removeSet := make(map[uint64]bool, len(remove))
 	for _, id := range remove {

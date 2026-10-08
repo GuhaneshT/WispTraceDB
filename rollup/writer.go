@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 )
 
-
 type AggregatedMetrics struct {
 	BucketKey BucketKey
 	Value     Value
@@ -27,8 +26,8 @@ const (
 	//   RecordCount     [14:22]  8 bytes  — int64 LE
 	//   MinWindowStart  [22:30]  8 bytes  — int64 LE (zone metadata)
 	//   MaxWindowStart  [30:38]  8 bytes  — int64 LE (zone metadata)
-	rollupHeaderSize = 4 + 2 + 8 + 8 + 8 + 8 
-	rollupFramingSize = 4 + 4 
+	rollupHeaderSize  = 4 + 2 + 8 + 8 + 8 + 8
+	rollupFramingSize = 4 + 4
 )
 
 type Writer struct {
@@ -77,7 +76,6 @@ func (w *Writer) Flush(dir string, window string, windowSize int64) error {
 
 	bw := bufio.NewWriter(file)
 
-	
 	minWS := w.aggregatedMetrics[0].BucketKey.WindowStart
 	maxWS := w.aggregatedMetrics[0].BucketKey.WindowStart
 	for _, m := range w.aggregatedMetrics[1:] {

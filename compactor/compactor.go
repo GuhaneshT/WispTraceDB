@@ -16,18 +16,33 @@
 //
 // Crash safety comes from ordering alone: write the new segment (harmless if
 // orphaned) -> commit the Pebble batch (retryable if it fails) -> swap the
-// manifest -> only then unlink old segment files, which by then nothing
-// references.
+// manifest -> purge reader handles -> only then unlink old segment files,
+// which by then nothing references. The purge step exists because "nothing
+// references" is not enough on Windows: os.Remove also needs no open handle,
+// and the reader cache may still hold one (see Purger).
 package compactor
 
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/GuhaneshT/WispTraceDB/pebble"
 	"github.com/GuhaneshT/WispTraceDB/segment"
 	"github.com/GuhaneshT/WispTraceDB/wal"
 )
+
+// Purger is the pre-unlink handle handoff: compaction and expiry call Purge
+// with the ids they are about to remove, and Purge returning nil guarantees
+// no reader handle for those ids exists anywhere in the process. On Windows
+// os.Remove fails while any handle is open (see segment's
+// TestDeleteWhileOpenProbe), so this ordering is mandatory, not an
+// optimization. Normally the segment reader cache implements this; with no
+// cache registered the compactor's own scanners already open-and-close
+// before reaching the unlink.
+type Purger interface {
+	Purge(ids []uint64) error
+}
 
 // Compactor executes merges and expiry against one engine's segment
 // directory, manifest, and Pebble index.
@@ -35,12 +50,21 @@ type Compactor struct {
 	segmentDir string
 	manifest   *segment.Manifest
 	index      *pebble.DB
+	purger     Purger // optional; nil means no pre-unlink handle handoff
 }
 
 // New returns a Compactor bound to the given segment directory, manifest,
 // and index. All three must belong to the same WispTrace instance.
 func New(segmentDir string, manifest *segment.Manifest, index *pebble.DB) *Compactor {
 	return &Compactor{segmentDir: segmentDir, manifest: manifest, index: index}
+}
+
+// WithPurger registers the pre-unlink purger and returns c for chaining. Pass
+// a non-nil purger only: a typed-nil interface would pass the nil check in
+// purgeAndUnlink and panic when called.
+func (c *Compactor) WithPurger(p Purger) *Compactor {
+	c.purger = p
+	return c
 }
 
 // Result reports what a Compact or Expire call did.
@@ -158,11 +182,11 @@ func (c *Compactor) Compact(oldIDs []uint64, newSegmentID uint64) (*Result, erro
 	}
 
 	// Safe to unlink: every key from these segments was moved, reclaimed, or
-	// was already stale (never pointing here).
-	for _, id := range oldIDs {
-		if err := os.Remove(segment.SegmentPath(c.segmentDir, id)); err != nil && !os.IsNotExist(err) {
-			return result, fmt.Errorf("unlink segment %d after successful compaction: %w", id, err)
-		}
+	// was already stale (never pointing here). Purge first so no reader
+	// handle is open when os.Remove runs, then retry briefly for handles we
+	// do not own (search indexer, antivirus).
+	if err := c.purgeAndUnlink(oldIDs); err != nil {
+		return result, fmt.Errorf("unlink segments after successful compaction: %w", err)
 	}
 
 	return result, nil
@@ -229,10 +253,8 @@ func (c *Compactor) Expire(candidateIDs []uint64, cutoff int64) (*Result, error)
 
 	result := &Result{DroppedSegmentIDs: expiredIDs, SpansDropped: droppedCount, SpansStale: staleCount}
 
-	for _, id := range expiredIDs {
-		if err := os.Remove(segment.SegmentPath(c.segmentDir, id)); err != nil && !os.IsNotExist(err) {
-			return result, fmt.Errorf("unlink expired segment %d: %w", id, err)
-		}
+	if err := c.purgeAndUnlink(expiredIDs); err != nil {
+		return result, fmt.Errorf("unlink expired segments: %w", err)
 	}
 
 	return result, nil
@@ -260,4 +282,47 @@ func removeOrphan(result *segment.WriteResult) {
 	if result != nil {
 		_ = os.Remove(result.Path)
 	}
+}
+
+// purgeAndUnlink hands ids to the purger — which must close every reader
+// handle for them — and only then removes the files. The manifest swap has
+// already happened at this point, so a Purge failure (a reader held past the
+// purge deadline) aborts the unlink and leaves orphaned files: CheckConsistency
+// reports them and the next manifest reconciliation drops them. Disk leak,
+// never corruption, and never a partial unlink racing a live reader.
+func (c *Compactor) purgeAndUnlink(ids []uint64) error {
+	if c.purger != nil {
+		if err := c.purger.Purge(ids); err != nil {
+			return fmt.Errorf("purge segment readers: %w", err)
+		}
+	}
+	for _, id := range ids {
+		if err := removeWithRetry(segment.SegmentPath(c.segmentDir, id)); err != nil {
+			return fmt.Errorf("unlink segment %d: %w", id, err)
+		}
+	}
+	return nil
+}
+
+const (
+	unlinkAttempts     = 3
+	unlinkRetryBackoff = 50 * time.Millisecond
+)
+
+// removeWithRetry removes path, retrying briefly: our own handles are already
+// closed by the purge, but Windows also denies removal for handles we do not
+// own (search indexer, antivirus), which typically release within
+// milliseconds. An already-absent file is success — another path may have
+// removed it first, which the old unlink loops also treated as success.
+func removeWithRetry(path string) error {
+	var err error
+	for attempt := 1; attempt <= unlinkAttempts; attempt++ {
+		if err = os.Remove(path); err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if attempt < unlinkAttempts {
+			time.Sleep(unlinkRetryBackoff)
+		}
+	}
+	return err
 }

@@ -35,6 +35,12 @@ const (
 	defaultRetentionPeriod            = 7 * 24 * time.Hour
 	defaultSessionTimeout             = 5 * time.Second
 
+	// defaultSegmentCacheSize bounds the segment reader cache (see
+	// WispTraceConfig.SegmentCacheSize). 64 handles covers far more live
+	// segments than compaction keeps around, while staying small enough that
+	// a cold-cache restart reopens only what it actually reads.
+	defaultSegmentCacheSize = 64
+
 	// MaxCardinalityPerQuery is the hard limit on distinct values returned by cardinality queries
 	// (GetDistinctModels, GetDistinctTeams, GetDistinctAgents) to prevent OOM errors.
 	MaxCardinalityPerQuery = 10000
@@ -53,6 +59,14 @@ type WispTraceConfig struct {
 	CompactionInterval         time.Duration
 	RetentionPeriod            time.Duration
 	SessionTimeout             time.Duration
+
+	// SegmentCacheSize bounds how many segment reader handles stay open
+	// across reads (GetSpan, GetTrace, recovery dedupe). Zero applies
+	// defaultSegmentCacheSize; a negative value disables the cache entirely,
+	// which restores the pre-cache behaviour of one light open+close per
+	// read. RangeQuery never uses the cache: it needs bloom-section reads
+	// and seek-based scans that are not safe on a shared reader.
+	SegmentCacheSize int
 }
 
 // pendingSpan is an acknowledged span travelling from the WAL to a segment. It
@@ -79,6 +93,12 @@ type WispTrace struct {
 	checkpoint *Checkpoint
 	manifest   *segment.Manifest
 	rollups    *rollup.RollupManager
+
+	// segCache keeps exact-offset segment readers open across calls instead
+	// of reopening the file per read. Nil when SegmentCacheSize is negative
+	// (disabled), in which case acquireSegment falls back to a direct light
+	// open. Compaction purges it before unlinking (see Compactor).
+	segCache *segment.Cache
 
 	// Background loop lifecycle
 	ctx    context.Context
@@ -141,6 +161,7 @@ func DefaultWispTraceConfig() WispTraceConfig {
 		CompactionInterval:         defaultCompactionInterval,
 		RetentionPeriod:            defaultRetentionPeriod,
 		SessionTimeout:             defaultSessionTimeout,
+		SegmentCacheSize:           defaultSegmentCacheSize,
 	}
 }
 
@@ -182,6 +203,13 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 	if config.SessionTimeout == 0 {
 		config.SessionTimeout = defaultSessionTimeout
 	}
+	// SegmentCacheSize follows the zero-value-defaults convention while still
+	// allowing an explicit disable: 0 (unset) becomes the default cache size,
+	// negative disables caching and runs every read through a direct light
+	// open, exactly as before the cache existed.
+	if config.SegmentCacheSize == 0 {
+		config.SegmentCacheSize = defaultSegmentCacheSize
+	}
 
 	if err := os.MkdirAll(config.SegmentDir, 0755); err != nil {
 		return nil, fmt.Errorf("create segment dir: %w", err)
@@ -220,6 +248,12 @@ func CreateWispTraceWithConfig(config WispTraceConfig) (*WispTrace, error) {
 		ingestChan:    make(chan pendingSpan, 10000), // Buffer for bursty ingest
 		sessionBuffer: make(map[string]*traceState),
 		walPending:    make(map[uint64]int),
+	}
+
+	// The cache must exist before recovery: recover() dedupes replayed
+	// records through spanAlreadyIndexed, which reads through it.
+	if config.SegmentCacheSize > 0 {
+		wt.segCache = segment.NewCache(config.SegmentDir, config.SegmentCacheSize)
 	}
 
 	// Segment IDs are seeded from on-disk truth, not the checkpoint alone:
@@ -376,6 +410,26 @@ func (w *WispTrace) recover() error {
 	return nil
 }
 
+// acquireSegment returns a reader for one segment plus a release function
+// that must be called exactly once when the reader is no longer needed (extra
+// calls are harmless no-ops). With a cache configured the reader is shared
+// and outlives the call — ReadAt only, never ScanAll; without one this is a
+// direct light open and release closes the handle, the pre-cache behaviour.
+//
+// A purged segment (compacted away between the index read and this call)
+// fails with segment.ErrPurged instead of a not-found open error — the same
+// outcome for the caller: the record is gone.
+func (w *WispTrace) acquireSegment(id uint64) (*segment.Reader, func() error, error) {
+	if w.segCache != nil {
+		return w.segCache.Acquire(id)
+	}
+	reader, err := segment.OpenReaderLight(segment.SegmentPath(w.config.SegmentDir, id))
+	if err != nil {
+		return nil, nil, err
+	}
+	return reader, reader.Close, nil
+}
+
 // spanAlreadyIndexed reports whether the index already holds one entry for
 // span that resolves, via a readable segment file, back to an exact matching
 // record (same write, including Deleted flag, timestamp, and payload). If so
@@ -388,12 +442,12 @@ func (w *WispTrace) spanAlreadyIndexed(span wal.SpanPayload) bool {
 		return false
 	}
 
-	reader, err := segment.OpenReaderLight(segment.SegmentPath(w.config.SegmentDir, loc.SegmentID))
+	reader, release, err := w.acquireSegment(loc.SegmentID)
 	if err != nil {
 		return false
 	}
 	got, err := reader.ReadAt(loc.Offset)
-	reader.Close()
+	_ = release()
 
 	return err == nil && spansEqual(got, span)
 }
@@ -996,7 +1050,13 @@ func (w *WispTrace) maybeExpireLocked() {
 }
 
 func (w *WispTrace) Compactor() *compactor.Compactor {
-	return compactor.New(w.config.SegmentDir, w.manifest, w.index)
+	c := compactor.New(w.config.SegmentDir, w.manifest, w.index)
+	if w.segCache != nil {
+		// The cache must close its handles before the compactor unlinks the
+		// files — on Windows removal fails while any handle is open.
+		c = c.WithPurger(w.segCache)
+	}
+	return c
 }
 
 // bufferedSpan reports the authoritative state of spanID in the session buffer.
@@ -1047,13 +1107,13 @@ func (w *WispTrace) bufferedSpansByKey(traceID string) (map[string]wal.SpanPaylo
 		if traceID != "" && id != traceID {
 			continue
 		}
-for _, ps := range state.spans {
-		key := segment.CompositeKey(ps.span.TraceID, ps.span.SpanID)
-		if _, seen := byKey[key]; !seen {
-			order = append(order, key)
+		for _, ps := range state.spans {
+			key := segment.CompositeKey(ps.span.TraceID, ps.span.SpanID)
+			if _, seen := byKey[key]; !seen {
+				order = append(order, key)
+			}
+			byKey[key] = ps.span
 		}
-		byKey[key] = ps.span
-	}
 	}
 	return byKey, order
 }
@@ -1077,11 +1137,11 @@ func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found
 		return wal.SpanPayload{}, false, fmt.Errorf("index lookup: %w", err)
 	}
 
-	reader, err := segment.OpenReaderLight(segment.SegmentPath(w.config.SegmentDir, location.SegmentID))
+	reader, release, err := w.acquireSegment(location.SegmentID)
 	if err != nil {
 		return wal.SpanPayload{}, false, fmt.Errorf("open segment %d: %w", location.SegmentID, err)
 	}
-	defer reader.Close()
+	defer release()
 
 	span, err = reader.ReadAt(location.Offset)
 	if err != nil {
@@ -1120,20 +1180,23 @@ func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
 
 	if len(locations) > 0 {
 		readers := make(map[uint64]*segment.Reader)
+		var releases []func() error
 		defer func() {
-			for _, r := range readers {
-				r.Close()
+			for _, release := range releases {
+				_ = release()
 			}
 		}()
 
 		for _, loc := range locations {
 			reader, ok := readers[loc.SegmentID]
 			if !ok {
-				reader, err = segment.OpenReaderLight(segment.SegmentPath(w.config.SegmentDir, loc.SegmentID))
+				r, release, err := w.acquireSegment(loc.SegmentID)
 				if err != nil {
 					return nil, false, fmt.Errorf("open segment %d: %w", loc.SegmentID, err)
 				}
+				reader = r
 				readers[loc.SegmentID] = reader
+				releases = append(releases, release)
 			}
 
 			span, err := reader.ReadAt(loc.Offset)
@@ -1677,6 +1740,14 @@ func (w *WispTrace) Close() error {
 		}
 	}
 
+	// After the final flush, which may itself compact and purge: the cache
+	// must outlive every segment write path that hands ids to Purge.
+	if w.segCache != nil {
+		if err := w.segCache.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("segment cache close: %w", err))
+		}
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("wisptrace close errors: %v", errs)
 	}
@@ -1700,6 +1771,12 @@ func (w *WispTrace) CloseWithoutFlush() error {
 	if w.index != nil {
 		if err := w.index.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("index close: %w", err))
+		}
+	}
+
+	if w.segCache != nil {
+		if err := w.segCache.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("segment cache close: %w", err))
 		}
 	}
 

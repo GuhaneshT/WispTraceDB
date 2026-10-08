@@ -13,13 +13,13 @@ import (
 )
 
 const (
-	Magic uint32 = 0x57545331
+	Magic                 uint32 = 0x57545331
 	CurrentSegmentVersion uint16 = 2
 
 	// magic(4) + version(2) + segmentID(8) + spanCount(4) + minTimestamp(8)
 	// + maxTimestamp(8) + bloomSectionLength(4).
-	headerSize        = 4 + 2 + 8 + 4 + 8 + 8 + 4
-	recordFramingSize = 4 + 4
+	headerSize             = 4 + 2 + 8 + 4 + 8 + 8 + 4
+	recordFramingSize      = 4 + 4
 	bloomFalsePositiveRate = 0.01
 )
 

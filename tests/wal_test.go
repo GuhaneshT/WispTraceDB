@@ -10,7 +10,6 @@ import (
 	"github.com/GuhaneshT/WispTraceDB/wal"
 )
 
-
 func recordsEqual(a, b wal.WALRecord) bool {
 	return a.Span.TraceID == b.Span.TraceID &&
 		a.Span.SpanID == b.Span.SpanID &&

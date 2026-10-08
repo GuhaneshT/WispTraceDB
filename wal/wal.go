@@ -16,11 +16,9 @@ import (
 	"sync"
 )
 
-
 type WALMetadata struct {
 	Version uint8
 }
-
 
 const CurrentWALVersion uint8 = 1
 
@@ -28,7 +26,7 @@ type SpanPayload struct {
 	TraceID      string  // Distributed trace ID
 	SpanID       string  // Unique span identifier
 	ParentSpanID string  // Parent span identifier; "" means root span — same convention OTel uses, not a separate null encoding on the wire
-	Timestamp    int64 // When the span was created
+	Timestamp    int64   // When the span was created
 	AgentID      string  // Agent that processed this span
 	Model        string  // Model name/identifier
 	ToolName     string  // Tool invoked (if any)
@@ -41,20 +39,19 @@ type SpanPayload struct {
 	Payload      []byte  // Raw span data/metadata
 	Deleted      bool    // Whether this span has been marked deleted
 }
- 
+
 type WALRecord struct {
 	Metadata WALMetadata
 	Span     SpanPayload
 }
 
-
 const (
-	DefaultMaxSegmentSize uint64 = 4 * 1024 * 1024
-	recordHeaderSize             = 9
-	maxRecordSize         uint64 = 64 << 20
-	fixedPayloadHeaderSize = 8 + 4 + 4 + 8 + 8 + 1
-	strLenSize  = 2 // uint16 prefix for each string field
-	blobLenSize = 4 // uint32 prefix for the Payload blob
+	DefaultMaxSegmentSize  uint64 = 4 * 1024 * 1024
+	recordHeaderSize              = 9
+	maxRecordSize          uint64 = 64 << 20
+	fixedPayloadHeaderSize        = 8 + 4 + 4 + 8 + 8 + 1
+	strLenSize                    = 2 // uint16 prefix for each string field
+	blobLenSize                   = 4 // uint32 prefix for the Payload blob
 
 )
 
@@ -106,8 +103,8 @@ func getString(data []byte) (string, int, error) {
 func encodePayload(dst []byte, record WALRecord) {
 	span := record.Span
 	binary.LittleEndian.PutUint64(dst[0:8], uint64(span.Timestamp))
-	binary.LittleEndian.PutUint32(dst[8:12], uint32(span.TokensIn))   
-	binary.LittleEndian.PutUint32(dst[12:16], uint32(span.TokensOut)) 
+	binary.LittleEndian.PutUint32(dst[8:12], uint32(span.TokensIn))
+	binary.LittleEndian.PutUint32(dst[12:16], uint32(span.TokensOut))
 	binary.LittleEndian.PutUint64(dst[16:24], math.Float64bits(span.Cost))
 	binary.LittleEndian.PutUint64(dst[24:32], uint64(span.LatencyMs))
 	if span.Deleted {
@@ -117,13 +114,13 @@ func encodePayload(dst []byte, record WALRecord) {
 	}
 
 	off := fixedPayloadHeaderSize
-	for _, f := range stringFields(&span) { 
+	for _, f := range stringFields(&span) {
 		off += putString(dst[off:], *f)
 	}
 
-	binary.LittleEndian.PutUint32(dst[off:off+blobLenSize], uint32(len(span.Payload))) 
+	binary.LittleEndian.PutUint32(dst[off:off+blobLenSize], uint32(len(span.Payload)))
 	off += blobLenSize
-	copy(dst[off:], span.Payload) 
+	copy(dst[off:], span.Payload)
 }
 
 // serializePayload is a non-hot-path convenience wrapper around encodePayload
@@ -163,14 +160,14 @@ func deserializePayload(data []byte) (WALRecord, error) {
 
 	var span SpanPayload
 	span.Timestamp = int64(binary.LittleEndian.Uint64(data[0:8]))
-	span.TokensIn = int32(binary.LittleEndian.Uint32(data[8:12]))   
-	span.TokensOut = int32(binary.LittleEndian.Uint32(data[12:16])) 
-	span.Cost = math.Float64frombits(binary.LittleEndian.Uint64(data[16:24])) 
-	span.LatencyMs = int64(binary.LittleEndian.Uint64(data[24:32]))           
+	span.TokensIn = int32(binary.LittleEndian.Uint32(data[8:12]))
+	span.TokensOut = int32(binary.LittleEndian.Uint32(data[12:16]))
+	span.Cost = math.Float64frombits(binary.LittleEndian.Uint64(data[16:24]))
+	span.LatencyMs = int64(binary.LittleEndian.Uint64(data[24:32]))
 	span.Deleted = data[32] != 0
 
 	off := fixedPayloadHeaderSize
-	for _, f := range stringFields(&span) { 
+	for _, f := range stringFields(&span) {
 		s, n, err := getString(data[off:])
 		if err != nil {
 			return WALRecord{}, err
@@ -179,7 +176,7 @@ func deserializePayload(data []byte) (WALRecord, error) {
 		off += n
 	}
 
-	if len(data)-off < blobLenSize { 
+	if len(data)-off < blobLenSize {
 		return WALRecord{}, fmt.Errorf("wal payload truncated: want %d bytes for blob length, have %d", blobLenSize, len(data)-off)
 	}
 	blobLen := binary.LittleEndian.Uint32(data[off : off+blobLenSize])
@@ -192,7 +189,7 @@ func deserializePayload(data []byte) (WALRecord, error) {
 	copy(payload, data[off:blobEnd])
 	span.Payload = payload
 
-	return WALRecord{Span: span}, nil 
+	return WALRecord{Span: span}, nil
 }
 
 func putRecordHeader(buf []byte, version uint8, payload []byte) {

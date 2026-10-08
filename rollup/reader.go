@@ -16,7 +16,6 @@ func ReadSnapshot(path string, windowSize int64) (*Store, error) {
 	}
 	defer file.Close()
 
-	
 	var headerBuf [rollupHeaderSize]byte
 	if _, err := io.ReadFull(file, headerBuf[:]); err != nil {
 		return nil, fmt.Errorf("read rollup header: %w", err)
@@ -73,7 +72,6 @@ func ReadSnapshot(path string, windowSize int64) (*Store, error) {
 	return store, nil
 }
 
-
 func decodeRecord(payload []byte) (AggregatedMetrics, error) {
 	// Minimum: 8 (WindowStart) + 2 (model len uint16) = 10 bytes before model.
 	if len(payload) < 10 {
@@ -109,7 +107,7 @@ func decodeRecord(payload []byte) (AggregatedMetrics, error) {
 	minLatencyMs := int64(binary.LittleEndian.Uint64(payload[off:]))
 	off += 8
 	maxLatencyMs := int64(binary.LittleEndian.Uint64(payload[off:]))
-	_ = off 
+	_ = off
 
 	return AggregatedMetrics{
 		BucketKey: BucketKey{WindowStart: windowStart, Model: model},

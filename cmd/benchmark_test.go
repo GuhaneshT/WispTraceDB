@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -17,6 +18,12 @@ func benchConfig(b *testing.B) WispTraceConfig {
 	cfg.CheckpointPath = filepath.Join(dir, "checkpoint.dat")
 	cfg.ManifestPath = filepath.Join(dir, "manifest.dat")
 	cfg.SegmentFlushThreshold = 1000 // reasonable batch size for benchmarks
+	// A/B escape hatch for the segment reader cache: WISPTRACE_BENCH_NO_CACHE=1
+	// runs against the pre-cache path (one light open+close per read), so
+	// before/after numbers for the cache come from the same binaries.
+	if os.Getenv("WISPTRACE_BENCH_NO_CACHE") != "" {
+		cfg.SegmentCacheSize = -1
+	}
 	return cfg
 }
 

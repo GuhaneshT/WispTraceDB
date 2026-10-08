@@ -18,7 +18,6 @@ type Reader struct {
 	Blooms map[string]*bloom.Filter
 }
 
-
 func OpenReader(path string) (*Reader, error) {
 	file, err := os.Open(path)
 	if err != nil {

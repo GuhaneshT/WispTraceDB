@@ -177,6 +177,10 @@ func TestCloseFlushesRemainingBufferedSpans(t *testing.T) {
 // exist to catch). This is what a real crash looks like from recover()'s
 // perspective: the WAL is durable up to its last fsynced append, but nothing
 // buffered only in segmentWriter's memory survives.
+//
+// The segment cache is closed too: a real crash closes every file handle via
+// the OS, so the abandoned instance must not leave handles open that would
+// block the recovering instance's compaction unlink on Windows.
 func crashClose(t *testing.T, wt *WispTrace) {
 	t.Helper()
 	if err := wt.wal.Close(); err != nil {
@@ -184,6 +188,11 @@ func crashClose(t *testing.T, wt *WispTrace) {
 	}
 	if err := wt.index.Close(); err != nil {
 		t.Fatalf("index.Close() error = %v", err)
+	}
+	if wt.segCache != nil {
+		if err := wt.segCache.Close(); err != nil {
+			t.Fatalf("segCache.Close() error = %v", err)
+		}
 	}
 }
 
@@ -299,8 +308,8 @@ func TestRecoverIsNoopWithNoUnflushedRecords(t *testing.T) {
 
 func TestAutoCompactionTriggersPastThreshold(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.SegmentFlushThreshold = 1          // flush a new segment on every insert
-	cfg.CompactionSegmentThreshold = 4     // compact once live count exceeds 4
+	cfg.SegmentFlushThreshold = 1      // flush a new segment on every insert
+	cfg.CompactionSegmentThreshold = 4 // compact once live count exceeds 4
 
 	wt, err := CreateWispTraceWithConfig(cfg)
 	if err != nil {

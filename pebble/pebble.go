@@ -17,7 +17,7 @@ type SpanLocation struct {
 	Offset    uint64
 }
 
-//key = trace_id||span_id, value = (segment_id, offset).
+// key = trace_id||span_id, value = (segment_id, offset).
 type DB struct {
 	db   *pebble.DB
 	path string
