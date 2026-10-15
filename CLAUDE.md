@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with Wi
 
 ## What this is
 
-WispTraceDB is a single-node, embeddable trace store specialized for LLM agent spans. It is built according to **PAD1.md v1.3.1** (Architecture) and **PDD1.md v1.3** (Design), both frozen in the `docs/` folder. The architecture is **non-negotiable** until an explicit versioned amendment updates it.
+WispTraceDB is a single-node, embeddable trace store specialized for LLM agent spans. It is built according to **PAD1.md v1.3.2** (Architecture) and **PDD1.md v1.3** (Design), both frozen in the `docs/` folder. The architecture is **non-negotiable** until an explicit versioned amendment updates it.
 
 **Read `docs/PAD1.md` as the target design and this file as the as-built status.** Where the two disagree, the code and this file win; the gap is recorded in PAD1's amendment log rather than papered over.
 
@@ -34,7 +34,7 @@ Implementation follows a strict, sequenced order because durability and crash-co
   - Pebble trace index: key = `trace_id || span_id`, value = `(segment_id, offset)`.
   - **Reconciliation protocol (the riskiest surface):** span is durable-and-queryable only once both segment write and Pebble `Put` are confirmed.
   - Checkpoint/watermark: records the last segment-id for which both sides are confirmed consistent. Startup replay bounded to the checkpoint tail (v1.1 amendment).
-  - Tombstone path: **BROKEN as described, see "Known correctness bugs" below.** What the code actually does: `writeSegmentBatch` sends *every* span, tombstones included, through `BatchPutSpans`, so a tombstoned span stays indexed pointing at a real record until `compactor.Compact` reclaims it. The intended design was WAL `deleted=true` → Pebble `Delete` at the same key, with the tombstone effect landing only in the index and never in the segment.
+  - Tombstone path: **implemented.** WAL `deleted=true` → Pebble `Delete` at the same key, with the tombstone effect landing only in the index and never in the segment. `writeSegmentBatch` collapses each key to its last write, writes live records to a segment, and applies the tombstone deletes in the same atomic `BatchApplySpans` batch. (This was previously broken — tombstones were routed through `BatchPutSpans` and stayed indexed until compaction; see "Deletion semantics" below for the fix and rationale.)
   - Version tagging + documented downgrade path (v1.1 amendment, step 2a).
 
 - **Phase 3 — Compaction with MVCC-style segment visibility** ✅ COMPLETE
@@ -96,10 +96,10 @@ Full write-up with reasoning in `docs/TECHNICAL-GUIDE.md` §15.
 
 1. ~~Deleted spans are readable via `GetSpan` and `GetTrace`.~~ **Fixed** — see "Deletion semantics" above.
 2. ~~Deleted spans are still counted in rollups.~~ **Partially fixed** — tombstones are no longer counted at ingest; a span counted and deleted later still leaks (see residual note above).
-3. **No public delete API.** `WispTrace` has no `DeleteSpan`/`DeleteTrace`. Tombstones can only be created by a caller passing `wal.SpanPayload{Deleted: true}` to `InsertSpan`, which is what the tests do. This is the largest remaining gap in the deletion story: the fix is complete but unreachable from the public API.
-4. **Cardinality cap fires before the caller's `limit`** — `GetDistinctModels(ts, end, 5)` errors instead of returning 5 names once the scan reaches 10 000 distinct values.
+3. ~~No public delete API.~~ **Fixed** — `DeleteSpan(traceID, spanID)` and `DeleteTrace(traceID)` now exist on `WispTrace`. Both write tombstones through `InsertSpan` (the same path the tests already exercised), so the deletion fix is now reachable from the public API. `DeleteSpan` is idempotent and rejects empty identifiers; `DeleteTrace` enumerates the trace's live spans via `GetTrace` (so buffered and segment-resident spans are both covered), draining the ingest pipeline first with `WaitForIngest` so a just-acknowledged span cannot slip through. Pinned by `TestDeleteSpanRemovesSpanFromAllReadPaths`, `TestDeleteTraceRemovesOnlyThatTrace`, `TestDeleteEmptyIdentifiersError`, `TestDeleteNonExistentIsNoop`, `TestDeleteSpanDurableAcrossCrash` (`cmd/tombstone_test.go`).
+4. ~~Cardinality cap fires before the caller's `limit`.~~ **Fixed** — a positive `limit` now short-circuits the scan (`cardinalityStop`, `cmd/cmd.go`), so `GetDistinctModels(ts, end, 5)` returns 5 names instead of erroring once the scan would reach 10 000 distinct values. No limit (or a limit above the cap) still errors at the cap — the documented hard cap for unbounded queries. Pinned by `TestCardinalityStopHonoursLimitBeforeCap` and `TestGetDistinctModelsPositiveLimitShortCircuits` (`cmd/cmd_test.go`).
 5. **`QueryWithCursor` re-runs the full `RangeQuery` per page** and its numeric-offset cursor is not a stable snapshot; concurrent flush/compaction can make a client skip or duplicate spans.
-6. Minor: `maybeCompactLocked` burns a segment ID before its `recovering` guard (`cmd/cmd.go:750-757`); the `recovering` guard is also cleared before the final recovery flush, so its code comment overstates what it protects.
+6. Minor: `maybeCompactLocked` burns a segment ID before its `recovering` guard (`cmd/cmd.go:1022-1028`); the `recovering` guard is also cleared before the final recovery flush, so its code comment overstates what it protects.
 
 ## Known gaps (do not describe as shipped)
 
@@ -130,7 +130,7 @@ Full write-up with reasoning in `docs/TECHNICAL-GUIDE.md` §15.
   - **Hold guard (6 Oct 2026):** whenever `killAfter > 0` the driver sets `WISPTRACE_FAULT_HOLD=1`; the worker blocks after its own flush instead of exiting, and the driver `t.Fatalf`s if `workerCmd.Wait()` returns before the kill. This enforces the harness's own invariant — a *force*-kill test must kill a live process — which was previously false for `cool`: the worker exited cleanly and the "kill" landed after exit, so `cool` silently double-counted the graceful-close shape. `killAfter=0` (graceful-close) skips the hold. The `mid` timing's workload max was raised 800 → 4000 spans so the workload cannot finish before its 300 ms kill.
   - **Remaining harness gaps.** (1) The reopen retry has never fired — the Windows handle-release race is documented, not observed. (2) A kill opens only one of the three WAL-reclamation windows (the ingest-channel window); the expiry partial-flush and tombstone-only-batch windows cannot occur in these runs (sub-2s runs vs the 5 s session timeout; every-17th-tombstone mix never yields a pure-delete flush window) and are covered only by unit tests (`TestPartialFlushDoesNotReclaimStillBufferedRecord`, `TestTombstoneInSingleFlushWindowCollapsesBatch`). Published in `docs/blog/post-1-unconfirmed-is-not-corrupt.md`.
 
-### Phases 2–5 — Complete; Phase 6 partial
+### Phases 2–4 — Complete; Phase 5 partial; Phase 6 partial
 
 **pebble/pebble.go:**
 - `SpanLocation` struct: segment_id(8) + offset(8), the value half of every Pebble entry.
@@ -147,6 +147,8 @@ Full write-up with reasoning in `docs/TECHNICAL-GUIDE.md` §15.
 **bloom/ (new):** fixed-size bloom filters with Kirsch–Mitzenmacher double hashing over two deterministic stdlib FNV-1a/64 variants; serializes as `m(4)|k(4)|bits`, supports back-to-back decoding.
 
 **segment/ (implemented, row-oriented):** header `Magic(4)=0x57545331 | Version(2)=2 | segmentID(8) | spanCount(4) | minTimestamp(8) | maxTimestamp(8) | bloomSectionLength(4)`; immediately after is a bloom section with 5 filters (agent_id, model, tool_name, team, status) in fixed order; thereafter records are row-oriented `length(4)|crc32(4)` framed payloads from `wal.EncodeSpanPayload`. `Flush` refuses to overwrite an existing segment file and removes partial files on failure. `Manifest` is derived state (can be rebuilt from directory listing), written via tmp+fsync+rename.
+
+**segment/cache.go (reader cache):** a bounded, refcounted set of open segment readers keyed by segment id, sized by `Config.SegmentCacheSize` (default 64, negative disables). The exact-offset read paths (`GetSpan`, `GetTrace`, recovery's `spanAlreadyIndexed`) open through `acquireSegment`, which serves from the cache when configured and otherwise falls back to `OpenReaderLight` (header-only; **no bloom decode** — the fix that took `GetSpan` from 14,547 → 1,581 B/op at `cmd/cmd.go:422`). `RangeQuery` deliberately does not use the cache or the light open: it needs the bloom section and a seek-based `ScanAll`, neither safe on a shared reader. Handles use a pooled `*segment.Release` lease (idempotent via `fired atomic.Bool`): a reader is closed only when it leaves the map **and** its refcount hits zero. Compaction/expiry call `Purge(ids)` before `os.Remove` because Windows refuses to unlink an open file. Pinned by `cmd/cache_test.go`.
 
 **compactor/ (implemented):** `Compact` merges segments and performs segment/index co-deletion (Pebble delete batch committed before manifest swap and unlink). Includes a **staleness check** — every scanned span is re-verified against `index.GetSpan` before acting on it; stale copies do not resurrect superseded versions. `Expire` drops segments whose `MaxTimestamp` is past the cutoff and reuses the same co-deletion path; when all survivors are tombstones it writes no new segment.
 
@@ -230,7 +232,10 @@ bloom/
 
 segment/
   writer.go       — row-oriented segment writer: header, bloom section, records
-  reader.go       — segment reader: header/bloom access, ReadAt, ScanAll
+  reader.go       — segment reader: header/bloom access, ReadAt, ScanAll;
+                    OpenReaderLight (header-only, no bloom decode)
+  cache.go        — bounded refcounted reader cache; Release lease;
+                    Purge-before-unlink for Windows
   manifest.go     — derived segment-set pointer, tmp+fsync+rename swap
   *_test.go
 
@@ -251,6 +256,7 @@ cmd/
   checkpoint.go   — durable segment watermark
   tombstone_test.go — deletion semantics across all three read paths and both
                     flush timings (single-window, mixed, later-flush, un-flushed)
+  cache_test.go   — segment-cache purge wiring + disabled path
   benchmark_test.go — 8 benchmark harnesses (insert seq/parallel, GetSpan,
                     GetSpanWithCompaction, GetTrace, RangeQuery,
                     RangeQueryWithCompaction, SpanAlreadyIndexed; results in
@@ -262,7 +268,7 @@ tests/
                     ack oracle, force-kill driver, post-crash assertions
 
 docs/
-  PAD1.md         — frozen v1.3.1 architecture doc (non-negotiable)
+  PAD1.md         — frozen v1.3.2 architecture doc (non-negotiable)
   PDD1.md         — frozen v1.3 design doc (non-negotiable)
   checklist.txt   — build/work-split checklist and deferred items
   blog/

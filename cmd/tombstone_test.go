@@ -372,3 +372,168 @@ func TestGetTraceKeepsLiveSiblingsOfDeletedSpan(t *testing.T) {
 
 	assertConsistent(t, wt)
 }
+
+// The public DeleteSpan must remove a flushed span from all three read paths and
+// from the index — the same guarantee the tests above check for a hand-built
+// tombstone, now reachable through the API.
+func TestDeleteSpanRemovesSpanFromAllReadPaths(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	live := testSpan("t1", "s1", 100)
+	if err := wt.InsertSpan(live); err != nil {
+		t.Fatalf("InsertSpan(live) error = %v", err)
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	if _, found, err := wt.GetSpan("t1", "s1"); err != nil || !found {
+		t.Fatalf("span should be readable before delete: found=%v err=%v", found, err)
+	}
+
+	if err := wt.DeleteSpan("t1", "s1"); err != nil {
+		t.Fatalf("DeleteSpan() error = %v", err)
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() after delete error = %v", err)
+	}
+
+	assertNotReadable(t, wt, "t1", "s1")
+	assertTraceGone(t, wt, "t1")
+	assertNotIndexed(t, wt, "t1", "s1")
+	assertConsistent(t, wt)
+}
+
+// DeleteTrace must remove every span of the named trace and nothing else: a
+// live span in a different trace must survive untouched.
+func TestDeleteTraceRemovesOnlyThatTrace(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	doomed := []wal.SpanPayload{
+		testSpan("t1", "s1", 100),
+		testSpan("t1", "s2", 110),
+	}
+	keeper := testSpan("t2", "s1", 120)
+	for _, s := range append(append([]wal.SpanPayload{}, doomed...), keeper) {
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan(%s/%s) error = %v", s.TraceID, s.SpanID, err)
+		}
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	if err := wt.DeleteTrace("t1"); err != nil {
+		t.Fatalf("DeleteTrace() error = %v", err)
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() after delete error = %v", err)
+	}
+
+	assertTraceGone(t, wt, "t1")
+	for _, s := range doomed {
+		assertNotIndexed(t, wt, "t1", s.SpanID)
+	}
+
+	got, found, err := wt.GetSpan("t2", "s1")
+	if err != nil || !found || got.SpanID != "s1" {
+		t.Fatalf("live span in an untouched trace was affected: found=%v err=%v span=%+v", found, err, got)
+	}
+	assertConsistent(t, wt)
+}
+
+// The delete API must reject empty identifiers rather than writing a tombstone
+// whose composite key ("||", "t1||") could collide across traces.
+func TestDeleteEmptyIdentifiersError(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	if err := wt.DeleteSpan("", "s1"); err == nil {
+		t.Fatal("DeleteSpan(empty traceID) = nil, want error")
+	}
+	if err := wt.DeleteSpan("t1", ""); err == nil {
+		t.Fatal("DeleteSpan(empty spanID) = nil, want error")
+	}
+	if err := wt.DeleteTrace(""); err == nil {
+		t.Fatal("DeleteTrace(empty traceID) = nil, want error")
+	}
+}
+
+// Deleting a span or trace that was never inserted is a no-op, not an error,
+// and must not manufacture a readable span.
+func TestDeleteNonExistentIsNoop(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	if err := wt.DeleteTrace("never-existed"); err != nil {
+		t.Fatalf("DeleteTrace(nonexistent) = %v, want nil", err)
+	}
+	if err := wt.DeleteSpan("never-existed", "s1"); err != nil {
+		t.Fatalf("DeleteSpan(nonexistent) = %v, want nil", err)
+	}
+	assertNotReadable(t, wt, "never-existed", "s1")
+
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	assertNotReadable(t, wt, "never-existed", "s1")
+	assertConsistent(t, wt)
+}
+
+// A delete issued through the public API must survive a crash before its flush:
+// the tombstone is durable in the WAL, so recovery must not resurrect the span.
+func TestDeleteSpanDurableAcrossCrash(t *testing.T) {
+	cfg := testConfig(t)
+	wt, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+
+	live := testSpan("t1", "s1", 100)
+	if err := wt.InsertSpan(live); err != nil {
+		t.Fatalf("InsertSpan() error = %v", err)
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	if err := wt.DeleteSpan("t1", "s1"); err != nil {
+		t.Fatalf("DeleteSpan() error = %v", err)
+	}
+	wt.WaitForIngest()
+
+	// Crash before the tombstone's flush: the delete exists only in the WAL.
+	crashClose(t, wt)
+
+	wt2, err := CreateWispTraceWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("reopen CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt2.Close()
+
+	if span, found, err := wt2.GetSpan("t1", "s1"); err != nil {
+		t.Fatalf("GetSpan() error = %v", err)
+	} else if found {
+		t.Fatalf("deleted span was resurrected after crash recovery: %+v", span)
+	}
+	assertTraceGone(t, wt2, "t1")
+}

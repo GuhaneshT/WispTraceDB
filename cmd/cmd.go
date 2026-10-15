@@ -1236,6 +1236,57 @@ func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
 	return spans, true, nil
 }
 
+// DeleteSpan durably deletes a single span by writing a tombstone for its key.
+//
+// The tombstone's only durable effect is removing the key from the Pebble index
+// at flush time (see the "Deletion semantics" note in the README); no tombstone
+// record is ever written to a segment. It is idempotent and succeeds whether or
+// not the span currently exists — deleting an absent span is a no-op, not an
+// error, so a caller does not have to read-then-delete.
+//
+// The call returns once the tombstone's WAL record is fsynced, so the deletion
+// survives a crash from that point on. The read paths report the span as absent
+// immediately (a buffered tombstone supersedes any indexed copy); its physical
+// record is reclaimed when compaction next touches its segment.
+func (w *WispTrace) DeleteSpan(traceID, spanID string) error {
+	if traceID == "" || spanID == "" {
+		return fmt.Errorf("DeleteSpan: traceID and spanID must be non-empty")
+	}
+	return w.InsertSpan(wal.SpanPayload{TraceID: traceID, SpanID: spanID, Deleted: true})
+}
+
+// DeleteTrace durably deletes every live span of a trace by writing a tombstone
+// for each. A trace that does not exist is a no-op (nil error), so callers do
+// not need to check first.
+//
+// The set of spans to delete is enumerated via GetTrace, so it covers spans that
+// are still buffered as well as those already in segments. The ingest pipeline
+// is drained first (WaitForIngest), so a span acknowledged just before this call
+// is included rather than slipping through as a live survivor. A concurrent
+// InsertSpan for the same trace that lands after that drain is not covered — a
+// delete is a point-in-time operation, not a lock on the trace id.
+func (w *WispTrace) DeleteTrace(traceID string) error {
+	if traceID == "" {
+		return fmt.Errorf("DeleteTrace: traceID must be non-empty")
+	}
+
+	w.WaitForIngest()
+
+	spans, found, err := w.GetTrace(traceID)
+	if err != nil {
+		return fmt.Errorf("DeleteTrace(%s): %w", traceID, err)
+	}
+	if !found {
+		return nil
+	}
+	for _, s := range spans {
+		if err := w.InsertSpan(wal.SpanPayload{TraceID: traceID, SpanID: s.SpanID, Deleted: true}); err != nil {
+			return fmt.Errorf("DeleteTrace(%s): tombstone span %s: %w", traceID, s.SpanID, err)
+		}
+	}
+	return nil
+}
+
 // RangeFilter selects spans by time range and, optionally, bounded-cardinality
 // dimension values. An empty string on any dimension field means "don't filter".
 type RangeFilter struct {
@@ -1618,22 +1669,43 @@ func (w *WispTrace) GetErrorRate(model string, startTS, endTS int64) (float64, e
 	return (float64(errorCount) / float64(len(spans))) * 100.0, nil
 }
 
+// cardinalityStop returns the number of distinct values to collect before the
+// scan stops, and whether reaching that number is an error.
+//
+// A caller-supplied limit short-circuits the scan: once it is reached there is
+// nothing more to gather, so the MaxCardinalityPerQuery safety cap must not fire
+// first. With no limit (limit <= 0), or a limit above the cap, the cap still
+// applies and is a hard error — preserving the documented "hard-capped for
+// safety" contract for unbounded or huge-cardinality queries.
+func cardinalityStop(limit int) (stop int, errOnCap bool) {
+	if limit > 0 && limit <= MaxCardinalityPerQuery {
+		return limit, false
+	}
+	return MaxCardinalityPerQuery, true
+}
+
 // GetDistinctModels returns a sorted list of unique model names seen within [startTS, endTS].
 // limit: maximum number of results to return (0 = no limit, but hard-capped at MaxCardinalityPerQuery for safety).
+// A positive limit short-circuits the scan and is honoured before the cardinality cap, so
+// GetDistinctModels(ts, end, 5) returns 5 names rather than erroring once the scan would
+// exceed MaxCardinalityPerQuery.
 func (w *WispTrace) GetDistinctModels(startTS, endTS int64, limit int) ([]string, error) {
 	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
 	if err != nil {
 		return nil, err
 	}
+	stop, errOnCap := cardinalityStop(limit)
 	seen := make(map[string]bool)
 	var models []string
 	for _, s := range spans {
 		if s.Model != "" && !seen[s.Model] {
 			seen[s.Model] = true
 			models = append(models, s.Model)
-			// Stop early if cardinality safety limit reached
-			if len(models) >= MaxCardinalityPerQuery {
-				return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct models (limit: %d)", len(models), MaxCardinalityPerQuery)
+			if len(models) >= stop {
+				if errOnCap {
+					return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct models (limit: %d)", len(models), MaxCardinalityPerQuery)
+				}
+				break
 			}
 		}
 	}
@@ -1646,20 +1718,24 @@ func (w *WispTrace) GetDistinctModels(startTS, endTS int64, limit int) ([]string
 
 // GetDistinctTeams returns a sorted list of unique team names seen within [startTS, endTS].
 // limit: maximum number of results to return (0 = no limit, but hard-capped at MaxCardinalityPerQuery for safety).
+// A positive limit short-circuits the scan and is honoured before the cardinality cap.
 func (w *WispTrace) GetDistinctTeams(startTS, endTS int64, limit int) ([]string, error) {
 	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
 	if err != nil {
 		return nil, err
 	}
+	stop, errOnCap := cardinalityStop(limit)
 	seen := make(map[string]bool)
 	var teams []string
 	for _, s := range spans {
 		if s.Team != "" && !seen[s.Team] {
 			seen[s.Team] = true
 			teams = append(teams, s.Team)
-			// Stop early if cardinality safety limit reached
-			if len(teams) >= MaxCardinalityPerQuery {
-				return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct teams (limit: %d)", len(teams), MaxCardinalityPerQuery)
+			if len(teams) >= stop {
+				if errOnCap {
+					return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct teams (limit: %d)", len(teams), MaxCardinalityPerQuery)
+				}
+				break
 			}
 		}
 	}
@@ -1672,20 +1748,24 @@ func (w *WispTrace) GetDistinctTeams(startTS, endTS int64, limit int) ([]string,
 
 // GetDistinctAgents returns a sorted list of unique agent IDs seen within [startTS, endTS].
 // limit: maximum number of results to return (0 = no limit, but hard-capped at MaxCardinalityPerQuery for safety).
+// A positive limit short-circuits the scan and is honoured before the cardinality cap.
 func (w *WispTrace) GetDistinctAgents(startTS, endTS int64, limit int) ([]string, error) {
 	spans, err := w.RangeQuery(RangeFilter{StartTS: startTS, EndTS: endTS})
 	if err != nil {
 		return nil, err
 	}
+	stop, errOnCap := cardinalityStop(limit)
 	seen := make(map[string]bool)
 	var agents []string
 	for _, s := range spans {
 		if s.AgentID != "" && !seen[s.AgentID] {
 			seen[s.AgentID] = true
 			agents = append(agents, s.AgentID)
-			// Stop early if cardinality safety limit reached
-			if len(agents) >= MaxCardinalityPerQuery {
-				return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct agents (limit: %d)", len(agents), MaxCardinalityPerQuery)
+			if len(agents) >= stop {
+				if errOnCap {
+					return nil, fmt.Errorf("cardinality limit exceeded: found %d distinct agents (limit: %d)", len(agents), MaxCardinalityPerQuery)
+				}
+				break
 			}
 		}
 	}

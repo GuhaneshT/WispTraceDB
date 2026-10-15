@@ -1,7 +1,51 @@
 # Architecture Doc 1
-### Status: **FROZEN v1.3.1** — baseline for implementation
+### Status: **FROZEN v1.3.2** — baseline for implementation
 
 Defines the *how*. See `PDD1.md` for the *why*, *who*, and *what*.
+
+---
+
+## Amendment v1.3.2 (as-built record — supersedes the "never touches Pebble" range-scan claim; two further implementation refinements)
+
+**Status:** the design decision this version makes — delete the index key on
+tombstone and re-verify liveness on the range path — is written out in full in the
+**freeze notes at the end of this document**. Read those for the decision and its
+reasoning and its one recorded regression (`CheckConsistency` can no longer
+distinguish a deleted key from a lost index write). This entry is the summary that
+belongs in the amendment log; it also records two as-built refinements that the
+freeze note does not mention.
+
+1. **§3's Pillar 3 sentence "no Pebble in the hot loop" is a *target*, not current
+   reality.** A span deleted after its segment was written is still physically
+   present in that immutable segment; the deletion is a negative fact only the
+   index can see. `RangeQuery` therefore issues **one `index.GetSpan` per surviving
+   candidate** and emits only on an exact `(segment_id, offset)` match — the same
+   staleness check §3 already requires the compactor to apply. Cost: one index
+   lookup per candidate on a path already measured at ~132 allocs/span; the
+   snapshot-iterator optimization is deliberately deferred.
+
+2. **Exact-offset reads use a header-only open and a bounded reader cache.** The
+   as-built answer to "how does a point lookup open a segment" is
+   `segment.OpenReaderLight` (header only, **no bloom decode**) plus
+   `segment.Cache` (bounded, refcounted, `Config.SegmentCacheSize`, default 64,
+   negative disables), reached through `acquireSegment`. An implementation
+   refinement, not a design change: `RangeQuery` still opens the full reader
+   because it prunes with the blooms.
+
+3. **WAL reclamation is derived from what is still unflushed, never predicted
+   from flush timing.** §3 requires "acknowledged means durable"; the as-built
+   mechanism counts acknowledged-but-not-yet-segment-durable records per WAL
+   segment (`walPending`) and reclaims strictly below the lowest still-pending
+   segment (`releaseWALPending`). The earlier prediction — reclaim below the WAL
+   segment active at the previous drain — silently dropped the only durable copy
+   of an acknowledged span in three ordinary situations (a record still in the
+   ingest channel, a partial flush, a tombstone-only batch), and was caught only
+   by the fault-injection harness.
+
+**Explicitly unchanged:** this amendment does not weaken §3. Immutable segments,
+`fsync`-before-ack, and WAL-as-source-of-truth are unchanged. It records the
+as-built read path and reclamation mechanism so §3 is not read as a description of
+shipped behavior.
 
 ---
 

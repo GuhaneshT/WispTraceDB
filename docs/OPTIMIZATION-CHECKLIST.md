@@ -13,13 +13,13 @@ each phase.
 - [x] Confirm `BenchmarkGetSpanWithCompaction` is valid (unique keys) — 4.5x B/op, same allocs; direct evidence for Phase 1 bloom-decode-on-open
 - [x] Re-run `BenchmarkRangeQueryWithCompaction` and `TestCompactionDiagnostic` after the key-collision fix; record valid post-compaction scan numbers — `docs/benchmarks/compaction-20261003.txt` Run 2 (RangeQuery 12.59 ms / 3.04 MB / 70,170 allocs; GetSpan 296 µs / 65.7 KB / 36 allocs)
 - [x] Attribute the valid compacted RangeQuery latency — a 1000-ts window sits inside a 5000-span merged segment, so ScanAll decodes 5000 records and the staleness check issues 5000 index.GetSpan calls before the cheap in-memory time filter. pprof not needed: the order + counts explain it.
-- [x] Reorder RangeQuery to run `filter.matches` BEFORE the per-candidate `index.GetSpan` staleness lookup (correctness-neutral; cuts ~5000 Pebble point reads to ~101 per query at this shape) — `cmd/cmd.go:1186-1203`
+- [x] Reorder RangeQuery to run `filter.matches` BEFORE the per-candidate `index.GetSpan` staleness lookup (correctness-neutral; cuts ~5000 Pebble point reads to ~101 per query at this shape) — `cmd/cmd.go:1361-1371`
 
 ## Phase 1: Point-lookup read path (Priority #1) — Reduce GetSpan overhead
 - [x] segment: Add `OpenReaderLight(path string)` that reads the header only (no bloom decode). `Blooms` stays nil. — `segment/reader.go`
-- [x] `cmd/GetSpan`: use `OpenReaderLight` instead of `OpenReader` — `cmd/cmd.go:1080`
-- [x] Apply light path in `spanAlreadyIndexed` (recovery path) — `cmd/cmd.go:391`; before/after benchmarked — `docs/benchmarks/post-p1b-20261006.txt` (14,591 → 1,615 B/op, 34 → 21 allocs)
-- [x] Apply light path in `GetTrace` when reading specific offsets — `cmd/cmd.go:1132`. GetTrace reads exact offsets through cached readers and never consults `reader.Blooms`. Before/after benchmarked — `docs/benchmarks/post-p1b-20261006.txt` (19,836 → 6,818 B/op, 148 → 135 allocs)
+- [x] `cmd/GetSpan`: use `OpenReaderLight` instead of `OpenReader` — `cmd/cmd.go:1140`
+- [x] Apply light path in `spanAlreadyIndexed` (recovery path) — `cmd/cmd.go:445`; before/after benchmarked — `docs/benchmarks/post-p1b-20261006.txt` (14,591 → 1,615 B/op, 34 → 21 allocs)
+- [x] Apply light path in `GetTrace` when reading specific offsets — `cmd/cmd.go:1193`. GetTrace reads exact offsets through cached readers and never consults `reader.Blooms`. Before/after benchmarked — `docs/benchmarks/post-p1b-20261006.txt` (19,836 → 6,818 B/op, 148 → 135 allocs)
 - [x] Verify no behavior change: existing tests pass (GetSpan returns correct spans, tombstones filtered, GetTrace correctness) — full suite + 6/6 fault injection green, 6 Oct 2026
 - [x] Benchmark GetSpan vs baseline; record improvement — `docs/benchmarks/post-p1-20261003.txt` (GetSpanWithCompaction B/op -97.5%, ns/op -43%)
 - [x] Measure the `RangeQuery` filter-before-index reorder — `docs/benchmarks/range-reorder-20261003.txt`
@@ -56,9 +56,9 @@ each phase.
 - [ ] Decide whether a snapshot iterator over the index (replacing N point `GetSpan` lookups in the staleness check) is worth it while preserving correctness. Correctness > perf.
 
 ## Phase 6: Correctness/API gaps (separate from benchmarks)
-- [ ] Public delete API (`DeleteSpan`/`DeleteTrace`) — currently only via `InsertSpan{Deleted:true}`.
+- [x] Public delete API (`DeleteSpan`/`DeleteTrace`) — both write tombstones via `InsertSpan`; `DeleteSpan` idempotent + rejects empty ids, `DeleteTrace` drains ingest then enumerates via `GetTrace`. Pinned by `cmd/tombstone_test.go`.
 - [ ] `QueryWithCursor`: avoid re-running full `RangeQuery` per page (design snapshot iterator/cursor over index+buffer).
-- [ ] Cardinality cap: return up to `limit` instead of erroring when the cap is reached.
+- [x] Cardinality cap: return up to `limit` instead of erroring when the cap is reached — a positive `limit` now short-circuits the scan (`cardinalityStop`, `cmd/cmd.go`); no-limit/over-cap queries still hard-error. Pinned by `TestCardinalityStopHonoursLimitBeforeCap` + `TestGetDistinctModelsPositiveLimitShortCircuits` (`cmd/cmd_test.go`).
 - [ ] Rollup deletion leak: document/track (span counted then deleted later). Reversing Count/Sum is exact; Min/Max latency needs a distribution the store does not keep.
 - [ ] `CheckConsistency`: lost-index-write detection gap (documented) — evaluate a second keyspace if needed.
 

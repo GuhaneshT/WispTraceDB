@@ -1239,3 +1239,54 @@ func TestTier3AndTier4QueryAPIs(t *testing.T) {
 		t.Fatalf("GetDistinctAgents() = %v, err = %v", agents, err)
 	}
 }
+
+// A caller-supplied limit must pre-empt the MaxCardinalityPerQuery safety cap:
+// GetDistinctModels(ts, end, 5) must return 5 names, not error, even when the
+// scan would otherwise reach the cap. This pins cardinalityStop, the decision
+// the cap-before-limit bug lived in — an end-to-end test would need
+// MaxCardinalityPerQuery+1 distinct inserts to exercise the same branch.
+func TestCardinalityStopHonoursLimitBeforeCap(t *testing.T) {
+	for _, limit := range []int{1, 5, MaxCardinalityPerQuery - 1, MaxCardinalityPerQuery} {
+		stop, errOnCap := cardinalityStop(limit)
+		if stop != limit || errOnCap {
+			t.Fatalf("cardinalityStop(%d) = (%d, %v), want (%d, false)", limit, stop, errOnCap, limit)
+		}
+	}
+	for _, limit := range []int{0, -1, MaxCardinalityPerQuery + 1} {
+		stop, errOnCap := cardinalityStop(limit)
+		if stop != MaxCardinalityPerQuery || !errOnCap {
+			t.Fatalf("cardinalityStop(%d) = (%d, %v), want (%d, true)", limit, stop, errOnCap, MaxCardinalityPerQuery)
+		}
+	}
+}
+
+// The positive-limit path must be wired through the public API, not just the
+// helper: the result is exactly limit long, sorted, and carries no error.
+func TestGetDistinctModelsPositiveLimitShortCircuits(t *testing.T) {
+	wt, err := CreateWispTraceWithConfig(testConfig(t))
+	if err != nil {
+		t.Fatalf("CreateWispTraceWithConfig() error = %v", err)
+	}
+	defer wt.Close()
+
+	models := []string{"gpt-4o", "claude-3-5-sonnet", "llama-3", "gpt-4o"}
+	for i, m := range models {
+		s := testSpan("t1", fmt.Sprintf("s%d", i), int64(100+i*10))
+		s.Model = m
+		if err := wt.InsertSpan(s); err != nil {
+			t.Fatalf("InsertSpan(%d) error = %v", i, err)
+		}
+	}
+	wt.WaitForIngest()
+	if err := wt.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	got, err := wt.GetDistinctModels(0, 1000, 2)
+	if err != nil {
+		t.Fatalf("GetDistinctModels(limit=2) error = %v, want nil", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("GetDistinctModels(limit=2) = %v, want exactly 2 names", got)
+	}
+}

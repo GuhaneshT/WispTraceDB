@@ -119,7 +119,7 @@ rather than defining a parallel encoding.
 
 ## 5. Pillar 1 — Ingest
 
-`WispTrace.InsertSpan(span)` — `cmd/cmd.go:438`. Three steps:
+`WispTrace.InsertSpan(span)` — `cmd/cmd.go:529`. Three steps:
 
 1. **`w.wal.AppendRecord(...)`** — acquires the WAL mutex, rotates if the active
    segment would overflow, appends `version(1) | crc32(4) | length(4) | payload`,
@@ -140,13 +140,18 @@ Nothing else is synchronous. Everything downstream is derived state.
 > production pattern.
 
 `ingestLoop` then calls `processSpan` for each span. `processSpan`
-(`cmd/cmd.go:495`) does two things, in this order:
+(`cmd/cmd.go:618`) does two things, in this order:
 
 1. **Feeds the rollups** — `w.rollups.Add(ts, model, ScaleCost(cost), tokensIn,
-   tokensOut, latency)`. Unconditionally. Including tombstones. See §15, finding 2.
-2. **Appends to the session buffer** — an in-memory `map[traceID][]SpanPayload`
-   with a `lastSeen` timestamp per trace. If the total buffered span count crosses
-   `SegmentFlushThreshold`, it triggers a flush inline (suppressed during recovery).
+   tokensOut, latency)` — **only when the span is not a tombstone.** This is the
+   partial fix for §15 finding 2. A tombstone is skipped here so a span deleted
+   before it is counted never enters an aggregate; a span counted and deleted
+   *later* still keeps its contribution (the residual gap).
+2. **Appends to the session buffer** — an in-memory per-trace `[]pendingSpan` with
+   a `lastSeen` timestamp per trace. Each pending span also carries the WAL segment
+   id that holds its record (used by WAL reclamation). If the total buffered span
+   count crosses `SegmentFlushThreshold`, it triggers a flush inline (suppressed
+   during recovery).
 
 ### The WAL
 
@@ -156,10 +161,10 @@ Nothing else is synchronous. Everything downstream is derived state.
   All little-endian.
 - **Version byte** is `CurrentWALVersion = 1`. Replay rejects anything else
   explicitly rather than guessing.
-- **Torn-tail tolerance applies only to the last segment** (`wal.go:447`). A short
+- **Torn-tail tolerance applies only to the last segment** (`wal.go:466`). A short
   read or short payload there ends replay cleanly. The same condition on an earlier
   segment is a hard error, because a non-final segment being short means real damage.
-- **A CRC mismatch is always fatal** (`wal.go:500`), never tolerated — not even on
+- **A CRC mismatch is always fatal** (`wal.go:510`), never tolerated — not even on
   the last segment. The reasoning is in the source: every append is fsynced, so a
   crash truncates the tail rather than rewriting a complete record. A bad checksum is
   therefore corruption, not a torn write.
@@ -183,24 +188,37 @@ the pool gives each its own buffer without a second lock.
 Two triggers: the 1-second `segmentFlushLoop` ticker flushing traces idle longer than
 `SessionTimeout` (default 5 s), or the inline threshold flush from `processSpan`.
 
-Both converge on `writeSegmentBatch(spans, drainWAL)` — `cmd/cmd.go:578`. **This is
-the most important function in the system.** Ordering here is the whole product.
+Both converge on `writeSegmentBatch(spans []pendingSpan)` — `cmd/cmd.go:711`. **This
+is the most important function in the system.** Ordering here is the whole product.
 
 Under `flushMu`:
 
 1. **`w.wal.Rotate()`** — seal the active WAL segment. After this, nothing new
    appends to it.
-2. **Write the segment** — `segment.Writer.Flush`. See §7.
-3. **`w.index.BatchPutSpans(entries)`** — every record's `(segment_id, offset)`
-   committed in **one atomic Pebble batch** with `Sync: true`. A span is
-   queryable only once this returns.
-4. **`w.manifest.AddSegment(id)`** — write to `manifest.dat` via tmp + fsync +
+2. **Collapse the batch to the last write per composite key.** A span inserted and
+   then deleted within one flush window arrives as two entries; writing both into
+   one segment would leave a superseded live copy beside its own tombstone and give
+   the segment two records for one key. Order of first appearance is preserved.
+3. **Split into live records and tombstone keys.** A tombstone's only durable
+   effect is deleting its key from the index; it never needs a segment record.
+4. **Tombstone-only batch:** if there are no live records, write **no segment and
+   consume no segment id** — apply the index deletes via `BatchApplySpans(nil,
+   tombstoneKeys)`, snapshot rollups, release the WAL records, and return. (A
+   segment of pure tombstones would carry no index entries, so `reconcileManifest`
+   would drop it on the next open and the file would sit on disk unreferenced.)
+5. **Write the segment** — `segment.Writer.Flush`. See §7.
+6. **`w.index.BatchApplySpans(entries, tombstoneKeys)`** — the live records'
+   `(segment_id, offset)` and the tombstone deletes committed in **one atomic
+   Pebble batch**. A span is queryable only once this returns, and a tombstoned key
+   never coexists with a live index entry for the same key.
+7. **`w.manifest.AddSegment(id)`** — write to `manifest.dat` via tmp + fsync +
    rename.
-5. **`w.checkpoint.Save(id)`** — same tmp+fsync+rename discipline.
-6. **`w.flushRollups()`** — evict expired buckets and snapshot all four windows.
-7. **Reclaim WAL segments**, then set `w.walReclaimBelow = drainWAL`.
-8. `nextSegmentID++`.
-9. `maybeCompactLocked()` — inline, already holding `flushMu`.
+8. **`w.checkpoint.Save(id)`** — same tmp+fsync+rename discipline.
+9. **`w.flushRollups()`** — evict expired buckets and snapshot all four windows.
+10. **`w.releaseWALPending(spans)`** — now, and only now, this batch's WAL records
+    are redundant. See below.
+11. `nextSegmentID++`.
+12. `maybeCompactLocked()` — inline, already holding `flushMu`.
 
 ### Why rollups are flushed *here* and not only on the background ticker
 
@@ -211,20 +229,49 @@ ticker snapshots but already checkpointed into a segment would be **permanently
 unrecoverable for rollups**: `recover()` only replays the WAL tail, and by then
 `RemoveSegmentsUpTo` has already deleted it.
 
-### `walReclaimBelow` — the subtle one
+### WAL reclamation — `walPending` / `releaseWALPending`
 
-`walReclaimBelow` (`cmd/cmd.go:101-111`) exists because of a gap between "acked" and
-"drained". `InsertSpan` returns as soon as the WAL fsync completes. The span may sit
-in `ingestChan` for a while. If a flush then reclaimed the WAL segment that record
-lives in, the very next crash would lose an acknowledged span.
+WAL reclamation used to be phrased as a *prediction*: "reclaim everything below the
+WAL segment that was active when the previous flush drained." That was wrong, and it
+caused intermittent loss of acknowledged spans (caught only by the fault-injection
+harness). Three ordinary situations break the prediction:
 
-So the rule is: only reclaim segments **strictly below** the segment that was
-current when the *previous* flush took its drain snapshot. The reasoning — from the
-source — is that every record below that point was enqueued before that drain
-snapshotted, and is therefore part of the FIFO processed prefix, which was provably
-sealed into the previous flush's checkpointed segment.
+- an acknowledged span still sitting in `ingestChan` when a flush snapshots — the
+  record was already fsynced but the flush has no idea it exists;
+- a partial flush (`flushExpiredSessions` writes only the expired sessions but still
+  advanced the bound);
+- a tombstone-only batch, which advances the bound without writing a segment.
 
-The first flush never reclaims anything (`walReclaimBelow` starts at 0).
+The current design stops predicting and starts **counting**. `InsertSpan` calls
+`appendTracked` (`cmd/cmd.go:572`), which holds `walPendingMu` across the WAL append
+*and* the registration, so no reclaim can run in the window between the fsync and
+the count. `walPending[segID]` is the number of acknowledged-but-not-yet-durable
+records in each WAL segment. `releaseWALPending` (`cmd/cmd.go:878`) decrements the
+counts for the batch just committed, then reclaims everything strictly below the
+lowest still-pending segment (or below the active segment when nothing is pending):
+
+```go
+lowest := uint64(0)
+found := false
+for segID := range w.walPending {
+    if !found || segID < lowest { lowest, found = segID, true }
+}
+var bound uint64
+if found {
+    bound = lowest - 1                 // everything below the oldest unflushed record
+} else {
+    active := w.wal.CurrentSegment()
+    if active <= 1 { /* nothing to reclaim */ }
+    bound = active - 1                 // keep the segment being appended to
+}
+// ... w.wal.RemoveSegmentsUpTo(bound)
+```
+
+`flushAllSessions`, `flushExpiredSessions` and `Close` share one drain path, so a
+partial flush cannot advance the bound past a span it left buffered. Records replayed
+during recovery carry no pending registration (`walSeg == 0`); the single
+post-recovery flush reclaims them. A lost count under-reclaims (the WAL grows, which
+is boring) rather than over-reclaiming (data loss, silent until the next crash).
 
 ---
 
@@ -292,7 +339,7 @@ false negatives are not. A segment is never wrongly *excluded*; it can only be w
 
 ## 8. Pillar 3a — Compaction
 
-`compactor/compactor.go`. `maybeCompactLocked` (`cmd/cmd.go:737`) fires when the
+`compactor/compactor.go`. `maybeCompactLocked` (`cmd/cmd.go:1009`) fires when the
 live segment count exceeds `CompactionSegmentThreshold` (default 10), and merges the
 **oldest half** of the live set into one new segment.
 
@@ -347,7 +394,7 @@ because unlinking happens later. So reads remain correct throughout.
 ### `Expire`
 
 Same shape, no merge. `maybeExpireLocked` drops any segment whose header
-`MaxTimestamp` is past the retention cutoff (`cmd/cmd.go:770`), using the zone map
+`MaxTimestamp` is past the retention cutoff (`cmd/cmd.go:1042`), using the zone map
 so the decision costs one header read, then reuses the identical staleness +
 index-delete + manifest-swap + unlink path. The index entries are deleted *before*
 the files are unlinked, which is the only ordering that cannot dangle.
@@ -395,7 +442,7 @@ bucket each time.
 ### The unaligned-window gap
 
 `Store.GetBucketInRange` filters `WindowStart >= start && WindowStart < end`
-(`rollup/rollup.go:111`). For a query window that is not itself window-aligned, the
+(`rollup/rollup.go:109`). For a query window that is not itself window-aligned, the
 boundary buckets fail the comparison and are **silently dropped**. A query for
 `[10:00:30, 10:02:30)` returns nothing at all, because the 10:00 bucket starts before
 the range. The columnar-scan fallback that would fix this is designed and not built.
@@ -406,48 +453,60 @@ the range. The columnar-scan fallback that would fix this is designed and not bu
 
 ### `GetSpan(traceID, spanID)` — point
 
-1. Check the in-memory session buffer first (skips `Deleted` entries).
+1. `bufferedSpan` checks the in-memory session buffer first. It has a three-valued
+   return so "a tombstone is buffered" is distinct from "the buffer has nothing",
+   and it scans backwards so the last write for a span id wins.
 2. `index.GetSpan(CompositeKey(traceID, spanID))` → `(segment_id, offset)`.
-3. `segment.OpenReader(path)` then `reader.ReadAt(offset)`.
+3. `acquireSegment(segment_id)` returns a reader — from the segment reader cache
+   when configured, else a direct `OpenReaderLight`.
+4. `reader.ReadAt(offset)`, then a `Deleted` re-check as defence in depth for
+   pre-fix segments.
 
-`OpenReader` reads the 38-byte header **and decodes all five bloom filters into a
-map.** For a point lookup — which has an exact segment id and byte offset, and
-consults no bloom filter — this is pure waste. It is the direct cause of
-`GetSpan`'s 14 547 B / 35 allocs per lookup. See §14.
-
-> The segment path does **not** filter on `Deleted`. See §15, finding 1.
+`OpenReaderLight` reads the 38-byte header and **does not decode the bloom section**
+(a point lookup has an exact offset and consults no filter). Together with the reader
+cache, this is what took `GetSpan` from 14 547 B / 35 allocs to **1 581 B / 22
+allocs** (`docs/benchmarks/post-p1-20261003.txt`). A tombstoned key is deleted from
+the index at flush time, so `GetSpan` reports it as not found — see §15, finding 1.
 
 ### `GetTrace(traceID)` — full trace
 
-1. `index.PrefixScan(traceID + "||")` — a bounded Pebble iteration using
+1. Snapshots the session buffer as `key → last write` (`bufferedSpansByKey`).
+2. `index.PrefixScan(traceID + "||")` — a bounded Pebble iteration using
    `LowerBound`/`UpperBound` (the upper bound is computed by incrementing the last
    non-`0xFF` byte).
-2. Opens each referenced segment **once** into a per-query reader map.
-3. Reads each location.
-4. Appends anything still in the session buffer.
+3. Opens each referenced segment **once** into a per-query reader map, through
+   `acquireSegment` (cached / light open).
+4. Reads each location, skipping any key a buffered write supersedes and any record
+   flagged `Deleted` (defence in depth).
+5. Appends the buffered live spans.
 
-Step 2 is the pattern `GetSpan` should be using. It exists, it is understood, and it
-is one door over. See §14.
-
-No `Deleted` filter on this path either. See §15, finding 1.
+A trace consisting only of deleted spans reports not found. See §15, finding 1.
 
 ### `RangeQuery(filter)` — scan
 
-For each segment in the manifest:
+It snapshots the session buffer first (`bufferedSpansByKey("")`), then for each
+segment in the manifest:
 
-1. `OpenReader` (decodes all five blooms).
+1. `OpenReader` (decodes all five blooms). `RangeQuery` deliberately does **not**
+   use the reader cache or the light open — it needs the bloom section and
+   seek-based `ScanAll`, neither safe on a shared reader.
 2. **Zone-map prune:** skip if `MaxTimestamp < StartTS` or `MinTimestamp > EndTS`.
 3. **Bloom prune:** `mayMatchBlooms` — if any specified dimension is definitely
    absent, skip.
 4. `ScanAll` — sequential read from just past header+blooms to EOF, CRC-checking
    every record.
-5. Filter in memory: skip `Deleted`, apply the full predicate.
+5. Per record: skip `Deleted`, skip any key a buffered write supersedes, apply the
+   cheap in-memory predicate, then run the **staleness check** — `index.GetSpan(key)`
+   must resolve to exactly this `(segment_id, offset)` — before emitting.
 6. Close the reader.
 
 Then merge in matching in-memory spans.
 
-Both prunings happen *after* the open, so the zone map saves the scan but not the
-bloom decode. At the current scale the setup cost exceeds the scan.
+Step 5 is the correctness price of a segment-walking query: a span deleted *after*
+its segment was written is still physically present in that segment, and the deletion
+exists only in the index (§15, finding 2b). Both prunings happen *after* the open, so
+the zone map saves the scan but not the bloom decode; at the current scale the setup
+cost exceeds the scan.
 
 ### The derived queries
 
@@ -461,13 +520,16 @@ Note that `GetCostByModel` and friends **re-scan and re-decode every matching sp
 rather than reading the rollups. They are correct, and they are O(spans in range).
 The rollups exist for cheap aggregation; these functions just don't use them.
 
-`RangeQuery` never touches Pebble at all. It walks the manifest.
+`RangeQuery` walks the manifest for its candidate records, but it now issues **one
+Pebble `GetSpan` per surviving candidate** for the staleness check — so the old
+"never touches Pebble" description of this path no longer holds. Bloom and zone-map
+pruning narrow the candidate set; they say nothing about liveness.
 
 ---
 
 ## 11. Recovery
 
-`recover()` — `cmd/cmd.go:298`. Runs during `CreateWispTraceWithConfig`, before the
+`recover()` — `cmd/cmd.go:369`. Runs during `CreateWispTraceWithConfig`, before the
 background loops start.
 
 ### Two-phase drain
@@ -476,7 +538,7 @@ background loops start.
 w.recovering = true
 for _, record := range records {
     if w.spanAlreadyIndexed(record.Span) { continue }
-    w.processSpan(record.Span)
+    w.processSpan(pendingSpan{span: record.Span})
 }
 w.recovering = false
 if len(records) > 0 { w.flushAllSessions() }
@@ -508,7 +570,7 @@ compactor's index batch and its manifest swap. Rebuilding from the index means
 recovery cannot resurrect superseded segments.
 
 It also *fails loudly* if the index references a segment file that does not exist
-(`cmd/cmd.go:401`) — that is real data loss, not a reconciliation problem.
+(`cmd/cmd.go:493`) — that is real data loss, not a reconciliation problem.
 
 ---
 
@@ -540,7 +602,7 @@ Checks, in both directions:
 
 ## 13. Configuration
 
-`DefaultWispTraceConfig()` — `cmd/cmd.go:118`. Every zero value is replaced by its
+`DefaultWispTraceConfig()` — `cmd/cmd.go:150`. Every zero value is replaced by its
 default, so partial config structs are safe.
 
 | Field | Default | Meaning |
@@ -557,8 +619,17 @@ default, so partial config structs are safe.
 | `CompactionInterval` | 10 min | background compaction + expiry tick |
 | `RetentionPeriod` | 7 days | drives both segment expiry and rollup eviction |
 | `SessionTimeout` | 5 s | idle trace age that triggers a flush |
+| `SegmentCacheSize` | 64 | max open segment readers kept across reads; `0` → default, negative disables the cache |
 
 `MaxCardinalityPerQuery = 10000` is a package constant, not configurable.
+
+`SegmentCacheSize` backs `segment.Cache` (`segment/cache.go`): a bounded, refcounted
+set of open readers keyed by segment id, used by the exact-offset read paths
+(`GetSpan`, `GetTrace`, recovery's `spanAlreadyIndexed`). Compaction and expiry call
+`Purge(ids)` before unlinking — on Windows `os.Remove` fails while any handle is open
+— which is why a purge returning nil is the guarantee that unlink will succeed. The
+cache holds no persisted state; a crash simply ends the process and the OS closes the
+handles.
 
 ---
 
@@ -589,6 +660,22 @@ characteristics. **The ratios are the findings.**
 > any of these numbers — they are retained below for the shape of each problem, not as
 > current evidence.
 
+### Recorded read-path numbers after the P1/P1b fixes
+
+The three exact-offset callers now use `OpenReaderLight` (and the reader cache), each
+measured before/after. Bytes are the reliable signal; latency on this laptop is
+noise-bound in both directions.
+
+| Path | Before | After | Source |
+|---|---|---|---|
+| `GetSpan` | 14,547 B / 35 allocs | **1,581 B / 22 allocs** | `post-p1-20261003.txt` |
+| `GetSpan`, post-compaction | 65,684 B / 36 allocs | **1,644 B / 22 allocs** | `post-p1-20261003.txt` |
+| `GetTrace` | 19,836 B / 148 allocs | **6,818 B / 135 allocs** | `post-p1b-20261006.txt` |
+| `spanAlreadyIndexed` | 14,591 B / 34 allocs | **1,615 B / 21 allocs** | `post-p1b-20261006.txt` |
+
+Compaction remains unbenchmarked, and `RangeQuery` still carries the per-candidate
+staleness lookup and the per-query open/bloom-decode setup.
+
 ### Parallel insert scales 0.956x
 
 12 threads delivering 5% over one. Not "modest scaling" — effectively none.
@@ -607,7 +694,7 @@ decision that made compaction's partial merge safe makes group commit trivially 
 ### `GetSpan` costs 14 547 B to read a ~200-byte record
 
 `segment.OpenReader` decodes all five bloom filters into a `map[string]*Filter` on
-every open (`segment/reader.go:34`). A point lookup has an exact `(segment_id,
+every open (`segment/reader.go:33`). A point lookup has an exact `(segment_id,
 offset)` and consults none of them.
 
 **The suggested fix in `pers.txt` was an fd LRU cache. That treats the symptom.** The
@@ -669,7 +756,8 @@ the performance picture.
 
 Found by reading the source on 30 Sep 2026. Three of them were correctness bugs rather than
 performance ones, and **two have since been fixed** — see the resolution notes below. The
-third (2c) is a direct consequence of fixing the other two and remains open. The rest are open.
+third (2c) is a direct consequence of fixing the other two and remains open. Findings 3 and 4
+have since been fixed too. Findings 5, 6 and 7 remain open.
 
 ### Finding 1 — deleted spans are readable via `GetSpan` and `GetTrace` — **FIXED**
 
@@ -852,26 +940,50 @@ understood gap for an undocumented one.
 > second. Whenever the repair works by removing a record, ask what was using that record as
 > evidence.
 
-### Finding 3 — there is no public delete API
+### Finding 3 — there is no public delete API — **FIXED**
 
-`WispTrace` exposes no `DeleteSpan` or `DeleteTrace`. A tombstone can only be created
+**Severity: medium — the deletion fix worked but was unreachable.**
+
+`WispTrace` exposed no `DeleteSpan` or `DeleteTrace`. A tombstone could only be created
 by a caller constructing `wal.SpanPayload{Deleted: true}` and passing it to
-`InsertSpan` — which is exactly what the tests do. The product cannot currently
-express "delete this span" through its own API surface.
+`InsertSpan` — which is exactly what the tests did. The product could not express
+"delete this span" through its own API surface.
 
-### Finding 4 — cardinality cap fires before the caller's `limit`
+> **Resolution.** `DeleteSpan(traceID, spanID)` and `DeleteTrace(traceID)` now exist on
+> `WispTrace` and write tombstones through `InsertSpan`, the same path the tests already
+> exercised. `DeleteSpan` rejects empty identifiers and is idempotent (an absent span is
+> a no-op). `DeleteTrace` enumerates the trace's live spans via `GetTrace` — covering
+> both buffered and segment-resident spans — after draining the ingest pipeline with
+> `WaitForIngest`, so a span acknowledged just before the call cannot slip through as a
+> live survivor; a concurrent insert landing after that drain is not covered, by design
+> (a delete is a point-in-time operation, not a lock on the trace id). Pinned by
+> `TestDeleteSpanRemovesSpanFromAllReadPaths`, `TestDeleteTraceRemovesOnlyThatTrace`,
+> `TestDeleteEmptyIdentifiersError`, `TestDeleteNonExistentIsNoop` and
+> `TestDeleteSpanDurableAcrossCrash` (`cmd/tombstone_test.go`).
 
-`GetDistinctModels(startTS, endTS, limit)` returns an **error** when the scan reaches
-`MaxCardinalityPerQuery` distinct values (`cmd/cmd.go:1228`) — before the caller's
-`limit` is applied. So `GetDistinctModels(ts, end, 5)` against a database with 10 000+
-distinct models returns an error instead of 5 names. The `limit` should short-circuit
-the scan, or the cap should truncate rather than fail.
+### Finding 4 — cardinality cap fires before the caller's `limit` — **FIXED**
 
-Same in `GetDistinctTeams` and `GetDistinctAgents`.
+**Severity: medium. A caller's `limit` was ignored.**
+
+`GetDistinctModels(startTS, endTS, limit)` returned an **error** when the scan reached
+`MaxCardinalityPerQuery` distinct values — before the caller's `limit` was applied. So
+`GetDistinctModels(ts, end, 5)` against a database with 10 000+ distinct models errored
+instead of returning 5 names. Same in `GetDistinctTeams` and `GetDistinctAgents`.
+
+> **Resolution.** A positive `limit` now short-circuits the scan. `cardinalityStop`
+> (in `cmd/cmd.go`) returns the number of distinct values to collect before stopping and
+> whether reaching it is an error: a positive `limit` at or below the cap stops at
+> `limit` and is never an error, so the cap can no longer pre-empt it. With no limit
+> (or a limit above the cap) the `MaxCardinalityPerQuery` error is preserved — the
+> documented hard cap for unbounded queries. Fixed in all three `GetDistinct*`
+> functions. Pinned by `TestCardinalityStopHonoursLimitBeforeCap` and
+> `TestGetDistinctModelsPositiveLimitShortCircuits` (`cmd/cmd_test.go`); the latter
+> would need 10 001 distinct inserts to exercise the cap branch end-to-end, so the
+> decision function is pinned directly instead.
 
 ### Finding 5 — `QueryWithCursor` re-scans and can skip or duplicate
 
-`QueryWithCursor` (`cmd/cmd.go:1005`) calls the full `RangeQuery` and then slices by
+`QueryWithCursor` (`cmd/cmd.go:1412`) calls the full `RangeQuery` and then slices by
 numeric offset. Two consequences:
 
 - **Cost is O(total) per page**, not O(page).
@@ -885,16 +997,16 @@ documented as one.
 
 ### Finding 6 — `maybeCompactLocked` burns a segment ID before its recovery guard
 
-`cmd/cmd.go:750-757` increments `nextSegmentID` and *then* checks `w.recovering` and
+`cmd/cmd.go:1022-1028` increments `nextSegmentID` and *then* checks `w.recovering` and
 returns. Harmless — IDs are never reused, so burning one is safe — but the guard is
 in the wrong place.
 
 ### Finding 7 — the recovery guard does not cover the final recovery flush
 
 `w.recovering` is set to `false` before `flushAllSessions()` runs
-(`cmd/cmd.go:323-330`). The comment states that recovery "must not reclaim any WAL
+(`cmd/cmd.go:394-398`). The comment states that recovery "must not reclaim any WAL
 segment along the way," yet the final flush runs with the guard already down and can
-therefore trigger inline compaction. This is safe in practice — the `walReclaimBelow`
+therefore trigger inline compaction. This is safe in practice — the `releaseWALPending`
 discipline is independent of the `recovering` flag, and compaction during the final
 flush is correct — but the comment and the code disagree about what the flag protects.
 
@@ -948,7 +1060,8 @@ wal/wal.go              segmented write-ahead log; span payload codec (shared wi
 pebble/pebble.go        Pebble wrapper; (segment_id, offset) value codec; batched put/delete/apply
 bloom/bloom.go          FNV double-hash bloom filter, deterministic across processes
 segment/writer.go       segment writer: header, zone map, bloom section, records
-segment/reader.go       segment reader: header, blooms, ReadAt, ScanAll
+segment/reader.go       segment reader: header, blooms, ReadAt, ScanAll; OpenReaderLight
+segment/cache.go        bounded refcounted reader cache; Purge-before-unlink; Release
 segment/manifest.go     live segment set; tmp+fsync+rename swap
 compactor/compactor.go  merge, expiry, staleness check, index/file co-deletion
 rollup/rollup.go        bucket store, in-memory, locked
@@ -959,7 +1072,10 @@ cmd/cmd.go              engine wiring: ingest, sessions, flush, compaction, quer
 cmd/checkpoint.go       durable segment watermark
 cmd/consistency.go      index ↔ segment ↔ manifest cross-checks
 cmd/tombstone_test.go   deletion semantics: all three read paths, both flush timings
-cmd/benchmark_test.go   5 benchmark harnesses
+cmd/cache_test.go       segment-cache purge wiring + disabled path
+cmd/benchmark_test.go   8 benchmark harnesses (insert seq/parallel, GetSpan,
+                        GetSpanWithCompaction, GetTrace, RangeQuery,
+                        RangeQueryWithCompaction, SpanAlreadyIndexed)
 tests/wal_test.go       rotation, replay, corruption, tombstones
 tests/fault_injection_test.go  self-execed crashable worker, ack oracle, force-kill driver
 ```
