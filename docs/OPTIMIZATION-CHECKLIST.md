@@ -17,20 +17,20 @@ each phase.
 
 ## Phase 1: Point-lookup read path (Priority #1) — Reduce GetSpan overhead
 - [x] segment: Add `OpenReaderLight(path string)` that reads the header only (no bloom decode). `Blooms` stays nil. — `segment/reader.go`
-- [x] `cmd/GetSpan`: use `OpenReaderLight` instead of `OpenReader` — `cmd/cmd.go:981`
-- [ ] Apply light path in `spanAlreadyIndexed` (recovery path) — reverted, not measured
-- [ ] Apply light path in `GetTrace` when reading specific offsets — reverted, not measured. GetTrace reads exact offsets through cached readers and never consults `reader.Blooms`, so this is still a legitimate win; it needs its own benchmark before it is claimed.
-- [ ] Verify no behavior change: existing tests pass (GetSpan returns correct spans, tombstones filtered, GetTrace correctness)
+- [x] `cmd/GetSpan`: use `OpenReaderLight` instead of `OpenReader` — `cmd/cmd.go:1080`
+- [x] Apply light path in `spanAlreadyIndexed` (recovery path) — `cmd/cmd.go:391`; before/after benchmarked — `docs/benchmarks/post-p1b-20261006.txt` (14,591 → 1,615 B/op, 34 → 21 allocs)
+- [x] Apply light path in `GetTrace` when reading specific offsets — `cmd/cmd.go:1132`. GetTrace reads exact offsets through cached readers and never consults `reader.Blooms`. Before/after benchmarked — `docs/benchmarks/post-p1b-20261006.txt` (19,836 → 6,818 B/op, 148 → 135 allocs)
+- [x] Verify no behavior change: existing tests pass (GetSpan returns correct spans, tombstones filtered, GetTrace correctness) — full suite + 6/6 fault injection green, 6 Oct 2026
 - [x] Benchmark GetSpan vs baseline; record improvement — `docs/benchmarks/post-p1-20261003.txt` (GetSpanWithCompaction B/op -97.5%, ns/op -43%)
 - [x] Measure the `RangeQuery` filter-before-index reorder — `docs/benchmarks/range-reorder-20261003.txt`
 
 ## Phase 2: Segment FD/cache (Priority #2) — Avoid reopen churn
-- [ ] Design: LRU cache keyed by segment ID (or path). Stores opened reader (header + blooms, or light). Concurrency-safe (RWMutex) with eviction.
-- [ ] Implement segment cache (e.g. `segment/cache.go`) with max entries, `Close()` on eviction/`DB.Close()`.
-- [ ] Integrate: GetSpan, GetTrace, RangeQuery reuse cached readers where safe. GetTrace already does per-call caching; extend to cross-call.
-- [ ] Lifecycle: `DB.Close()` closes all cached readers; cache must not retain stale files on rename/compaction (segments are immutable; compaction creates new IDs).
-- [ ] Tests still pass; fault injection unaffected (file handles managed correctly).
-- [ ] Benchmark GetSpan/GetTrace/RangeQuery vs post-P1 baseline.
+- [x] Design: LRU cache keyed by segment ID. Stores light readers, refcounted so an entry closes only when *evicted AND idle*; `sync.Cond` waiters; permanent dead set for purged ids (blocks the reopen-after-purge resurrection race). — `segment/cache.go`
+- [x] Implement segment cache with max entries (`SegmentCacheSize` config: 0→default 64, negative→disabled), `Close()` on eviction and on `DB.Close()`/`CloseWithoutFlush()` (after the final flush, which may itself compact). — `segment/cache.go`, `cmd/cmd.go`
+- [x] Integrate GetSpan, GetTrace, `spanAlreadyIndexed` (recovery) via `acquireSegment`. **RangeQuery deliberately NOT cached**: it needs bloom-section reads and `ScanAll` seeks that are unsafe on a shared reader — recorded here as a won't-do, not an omission.
+- [x] Lifecycle/compaction: compactor takes a `Purger` (`WithPurger`) and calls `Purge(ids)` *before* unlink — closes handles so `os.Remove` succeeds on Windows (probe: `segment/delete_probe_test.go`); purge failure aborts the unlink → orphan file, reported by `CheckConsistency`, never corruption. Both `Close` paths close the cache; `crashClose` test helper closes it too (a real crash closes handles via the OS).
+- [x] Tests pass; fault injection unaffected — full suite green 8 Oct 2026 (`segment/cache_test.go` 10 tests, `cmd/cache_test.go` purge-wiring + disabled-path, fault injection green).
+- [ ] Benchmark GetSpan/GetTrace (+ SpanAlreadyIndexed) vs post-P1 baseline, with/without `WISPTRACE_BENCH_NO_CACHE=1` A/B escape — pending run.
 
 ## Phase 3: WAL Group Commit (Priority #3) — Fix parallel insert scaling (0.956x)
 - [ ] Design: batch appends with a single fsync. Pending batch (records + waiters/channels) + flusher (timer + batch size). Preserve synchronous ack semantics (InsertSpan returns after durable).
@@ -63,10 +63,10 @@ each phase.
 - [ ] `CheckConsistency`: lost-index-write detection gap (documented) — evaluate a second keyspace if needed.
 
 ## Validation Gates (must pass after each phase)
-- [ ] `go build ./...`
-- [ ] `go vet ./...`
-- [ ] `go test ./... -v`
-- [ ] `go test ./tests -run FaultInjection -v` (durability guard — critical for P3)
+- [x] `go build ./...`
+- [x] `go vet ./...` (clean, 8 Oct 2026)
+- [x] `go test ./... -v` (green, 8 Oct 2026 — includes Phase 2 cache tests)
+- [x] `go test ./tests -run FaultInjection -v` (durability guard — 6/6 green, 6 Oct 2026; `-short` re-run green 8 Oct 2026; critical for P3)
 - [ ] `go test -bench . -benchmem ./cmd` (compare against baseline)
 
 ## Notes

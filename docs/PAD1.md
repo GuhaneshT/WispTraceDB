@@ -1,7 +1,37 @@
 # Architecture Doc 1
-### Status: **FROZEN v1.3** — baseline for implementation
+### Status: **FROZEN v1.3.1** — baseline for implementation
 
 Defines the *how*. See `PDD1.md` for the *why*, *who*, and *what*.
+
+---
+
+## Amendment v1.3.1 (as-built record — §3 Pillar 2's per-column encoding is a *target*, not current reality)
+
+**What this records:** §3 Pillar 2 specifies per-column encoding (delta-of-delta
+timestamps, dictionary+RLE bounded strings, delta/XOR numerics, zstd payload).
+**None of it is implemented.** `segment/writer.go` writes row-oriented records
+using `wal.EncodeSpanPayload`. The only columnar-adjacent structures that exist
+are the per-dimension bloom section and the header's min/max zone map.
+
+**Why the deferral was correct, not drift:** `docs/checklist.txt` sequenced
+columnar work explicitly *behind* correctness — *"Columnar segments — only after
+the row-oriented format and query semantics are stable."* §3's own rationale for
+the numeric encoding even says **"Measure, don't assume"** about ratios. Encoding
+columns before the query semantics over them were stable would have been the
+premature half of that pair. The build order in §12 is itself a mechanism for
+legitimate deferral; this amendment records that deferral so §3 is not read as a
+description of shipped behavior.
+
+**Explicitly unchanged:** this amendment does not weaken §3. Columnar encoding
+remains the target design. The same v1.3.1 treatment applies to §6's root-attributed
+rollups (specified, not built — `rollup.BucketKey` is currently `{WindowStart,
+Model}`) and §6's columnar-scan fallback for unaligned windows (specified, not
+built).
+
+**Standing rule for readers of this doc:** §1–§14 describe the *target*. `CLAUDE.md`
+describes the *as-built* status and is authoritative where the two disagree. Any
+downstream artifact — README, blog post, marketing copy — must not describe the
+segment format as columnar until the encoding is implemented and measured.
 
 ---
 
@@ -263,14 +293,15 @@ standalone binary's shutdown path.
 
 ### Pillar 2 — Immutable storage & compaction
 
-**Job:** turn buffered spans into compact, columnar, on-disk segments;
-periodically merge small segments and prune expired data.
+**Job:** turn buffered spans into compact, on-disk segments; periodically merge
+small segments and prune expired data. (Intended end state is columnar — see
+"Per-column encoding" below and Amendment v1.3.1 for the as-built status.)
 
 **Guarantee:** segments are never partially visible; compaction never
 violates Pillar 1's durability contract — WAL entries are only eligible
 for truncation once the segment representing them is confirmed durable.
 
-**Per-column encoding:**
+**Per-column encoding (target design — NOT YET IMPLEMENTED, see Amendment v1.3.1; `segment/writer.go` currently writes row-oriented records):**
 
 | Column type | Encoding | Why |
 |---|---|---|
@@ -387,6 +418,23 @@ confirmed. Actual space reclamation — removing the tombstone entry itself
 and the segment data it shadows — happens at compaction time (§3), not at
 delete time; until then the tombstone is the authoritative answer.
 
+> **SUPERSEDED by Amendment v1.3.2 — read this paragraph as the historical
+> design, not the current one.** v1.3.2 changes the mechanism above in two
+> ways. First, the tombstone **deletes** the Pebble entry instead of pointing
+> at a tombstone record, and **no tombstone record is written to a segment at
+> all**; space reclamation of the shadowed segment data still happens at
+> compaction, but the index entry is removed at flush time rather than at
+> compaction time. The reasoning: leaving the record reachable and merely
+> flagged makes correct deletion depend on every read path remembering to
+> check the flag — and that convention is exactly what failed in v1.3.2's
+> audit, in `GetSpan` and `GetTrace` alike. Absence is structural; a flag is
+> a promise. Second, the paragraph above's "a point lookup hitting a
+> tombstone entry stops immediately and returns deleted" no longer has a
+> corresponding index state — a deleted key is simply not found, which is a
+> strictly stronger result. The consequence for consistency checking is
+> recorded in Amendment v1.3.2 and is a genuine capability loss, not an
+> oversight.
+
 **Where the LSM is used — and, just as importantly, where it is not:**
 exactly two touchpoints in the whole system.
 
@@ -397,6 +445,22 @@ exactly two touchpoints in the whole system.
   `Aggregation` queries use rollups (§6) instead. Neither needs an
   exact-match key lookup, so routing them through the LSM would be
   unnecessary indirection.
+
+> **PARTIALLY SUPERSEDED by Amendment v1.3.2.** The claim above that `Range`
+> queries never touch the LSM **was false** once tombstones were applied as
+> index deletes, and the code implemented it falsely until the deletion audit
+> found it: `RangeQuery` was returning deleted spans. A span deleted after its
+> segment was written is still physically present in that immutable segment,
+> and the deletion is a *negative* fact that bloom filters and zone maps —
+> which answer "could this value be present" — cannot express. `Range` now
+> performs one LSM lookup per candidate surviving bloom/zone-map pruning, to
+> confirm the index points at exactly that `(segment_id, offset)`. Pruning
+> still bounds the scan, and the intent of the original decision (avoid
+> unnecessary per-candidate exact-match lookups) survives at the level of
+> *pruned* candidates; it does not survive for candidates that get through.
+> The single-lookup-per-candidate cost is accepted deliberately and its
+> optimization (one snapshot iterator instead of N point lookups) is deferred,
+> not assumed.
 
 ---
 
@@ -656,4 +720,57 @@ not silent drift: any future change to the pillar structure, the
 trace-index/tag-index design, the payload-storage decision, the LSM
 boundary, the checkpoint mechanism, the tombstone/co-deletion protocol, or
 the rollup/root-attribution design introduced here should itself be a
-further deliberate, versioned amendment against this freeze.
+further deliberate, versioned amendment against this freeze. v1.3.1 is a
+narrower, non-design change: it records that §3's per-column encoding,
+§6's root-attributed rollups, and §6's columnar-scan fallback are all
+specified-but-not-implemented, and makes `CLAUDE.md` the authoritative
+as-built status. It adds no new design decisions and removes none, so
+that no downstream reader can mistake a target for a shipped feature.
+
+v1.3.2 is a correctness amendment, and the first one to arise from
+implementation rather than from the freeze review. It resolves a conflict
+between two previously-recorded decisions that only became visible once
+deletion semantics were actually built and audited against all three read
+paths.
+
+v1.2 specified tombstones and v1.3.1 recorded the index-reconciliation
+protocol as the mechanism, but neither said which of the two the tombstone
+should resolve to in the index — delete the entry, or repoint it at the
+tombstone record. §5's range/filter query path was separately specified as
+not touching the LSM index. Those two specifications are jointly
+unsatisfiable while deleted spans are invisible to queries: a span deleted
+after its segment was written is still physically present in that immutable
+segment, and the deletion exists only as the *absence* of an index entry — a
+negative fact that a segment walk cannot observe. Either the range path
+consults the index to re-verify each candidate, or it returns deleted spans.
+
+The resolution is to delete the index entry and require the re-verification:
+
+1. **Tombstones delete the index key; no tombstone record is written to a
+   segment.** Deleting makes a deleted span structurally unreachable by any
+   read path, rather than reachable-but-flagged, which would leave the
+   correctness of deletion depending on each read path remembering to filter
+   on `deleted` — a convention, not an invariant. Tombstone-only flush
+   batches write no segment and consume no segment id.
+2. **The §5 range/filter path issues one index lookup per surviving
+   candidate**, re-verifying that the index points at exactly that
+   `(segment_id, offset)` before emitting it — the same staleness rule
+   compaction already applies and §4 already implies for the index. This
+   supersedes the "never touches Pebble" characterization of that path. The
+   stated cost, one lookup per candidate, is accepted deliberately: the
+   correct optimization (one snapshot iterator in place of N point lookups) is
+   unmeasured and is deferred rather than assumed.
+3. **Consequence, recorded explicitly because it is a loss and not a gain:
+   `CheckConsistency` can no longer automatically distinguish a deliberately
+   deleted key from a lost index write**, because the index was the only
+   place recording the former and the rule above erases it. That condition is
+   therefore reported as a warning. An index entry resolving to nothing
+   readable remains a hard error. Restoring full detection requires a
+   separate durable record of deleted keys, which is specified-as-open and not
+   implemented.
+
+This version adds one design decision (index-delete tombstones), supersedes
+one performance claim (§5 index-free scan) with a measured-cost tradeoff
+rather than a free win, and records one capability regression (lost-index-write
+detection) that follows directly from that decision. It changes no pillar
+structure, no payload-storage decision, and no checkpoint mechanism.

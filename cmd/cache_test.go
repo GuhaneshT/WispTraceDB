@@ -80,8 +80,8 @@ func TestSegmentCachePurgeWiresThroughCompaction(t *testing.T) {
 		// Still blocked on the held reader — purge is wired in and waiting.
 	}
 
-	if err := release(); err != nil {
-		t.Fatalf("release() error = %v", err)
+	if err := release.Release(); err != nil {
+		t.Fatalf("release.Release() error = %v", err)
 	}
 	select {
 	case err := <-compacted:

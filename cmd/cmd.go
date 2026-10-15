@@ -410,16 +410,16 @@ func (w *WispTrace) recover() error {
 	return nil
 }
 
-// acquireSegment returns a reader for one segment plus a release function
-// that must be called exactly once when the reader is no longer needed (extra
-// calls are harmless no-ops). With a cache configured the reader is shared
-// and outlives the call — ReadAt only, never ScanAll; without one this is a
-// direct light open and release closes the handle, the pre-cache behaviour.
+// acquireSegment returns a reader for one segment plus a release handle that
+// must be released exactly once when the reader is no longer needed (extra
+// calls are harmless no-ops). With a cache configured the reader is shared and
+// outlives the call — ReadAt only, never ScanAll; without one this is a direct
+// light open and releasing closes the handle, the pre-cache behaviour.
 //
 // A purged segment (compacted away between the index read and this call)
 // fails with segment.ErrPurged instead of a not-found open error — the same
 // outcome for the caller: the record is gone.
-func (w *WispTrace) acquireSegment(id uint64) (*segment.Reader, func() error, error) {
+func (w *WispTrace) acquireSegment(id uint64) (*segment.Reader, *segment.Release, error) {
 	if w.segCache != nil {
 		return w.segCache.Acquire(id)
 	}
@@ -427,7 +427,7 @@ func (w *WispTrace) acquireSegment(id uint64) (*segment.Reader, func() error, er
 	if err != nil {
 		return nil, nil, err
 	}
-	return reader, reader.Close, nil
+	return reader, segment.NewDirectRelease(reader), nil
 }
 
 // spanAlreadyIndexed reports whether the index already holds one entry for
@@ -447,7 +447,7 @@ func (w *WispTrace) spanAlreadyIndexed(span wal.SpanPayload) bool {
 		return false
 	}
 	got, err := reader.ReadAt(loc.Offset)
-	_ = release()
+	_ = release.Release()
 
 	return err == nil && spansEqual(got, span)
 }
@@ -1141,7 +1141,7 @@ func (w *WispTrace) GetSpan(traceID, spanID string) (span wal.SpanPayload, found
 	if err != nil {
 		return wal.SpanPayload{}, false, fmt.Errorf("open segment %d: %w", location.SegmentID, err)
 	}
-	defer release()
+	defer release.Release()
 
 	span, err = reader.ReadAt(location.Offset)
 	if err != nil {
@@ -1180,10 +1180,10 @@ func (w *WispTrace) GetTrace(traceID string) ([]wal.SpanPayload, bool, error) {
 
 	if len(locations) > 0 {
 		readers := make(map[uint64]*segment.Reader)
-		var releases []func() error
+		var releases []*segment.Release
 		defer func() {
 			for _, release := range releases {
-				_ = release()
+				_ = release.Release()
 			}
 		}()
 

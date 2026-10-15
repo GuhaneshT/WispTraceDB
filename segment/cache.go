@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -97,16 +98,66 @@ func NewCache(segmentDir string, maxEntries int) *Cache {
 	return c
 }
 
-// Acquire returns a reader for the segment and a release function that must
-// be called exactly once when the reader is no longer needed (extra calls are
-// harmless no-ops). The reader may be shared with other goroutines; use ReadAt
-// only — ScanAll seeks and is not safe on a shared reader.
+// Release is a single-fire release handle for one Acquire. Call Release
+// exactly once when the reader is no longer needed; extra calls are no-ops and
+// the handle is safe to point at nothing after Release returns. Handles are
+// pooled, so caching a hit costs zero allocations per read — the exact-offset
+// path's per-call cost used to be the reopen, and a pooled handle keeps it out
+// of the per-call allocation budget the way a freshly built closure could not.
+type Release struct {
+	c      *Cache
+	e      *cacheEntry
+	reader *Reader // set only for a direct (non-cached) reader, see NewDirectRelease
+	fired  atomic.Bool
+}
+
+var releasePool = sync.Pool{
+	New: func() any { return &Release{} },
+}
+
+// Release returns the reader's lease over the entry. It is idempotent: a
+// second call is a no-op, and the handle is returned to the pool on the first
+// call. After Release returns the caller must not use the handle.
+func (r *Release) Release() error {
+	if r.fired.Swap(true) {
+		return nil
+	}
+	var err error
+	if r.reader != nil {
+		err = r.reader.Close()
+	} else {
+		err = r.c.release(r.e)
+		releasePool.Put(r)
+	}
+	return err
+}
+
+// NewDirectRelease wraps a reader so the callers that go through WispTrace's
+// acquireSegment abstraction can release it with the same handle type as a
+// cached one. Used for the no-cache path, where each read owns its reader.
+// The handle is not pooled (it is created per read, the baseline behavior).
+func NewDirectRelease(reader *Reader) *Release {
+	return &Release{reader: reader}
+}
+
+func releaseHandle(c *Cache, e *cacheEntry) *Release {
+	r := releasePool.Get().(*Release)
+	r.c = c
+	r.e = e
+	r.fired.Store(false)
+	return r
+}
+
+// Acquire returns a reader for the segment and a release handle that must be
+// released exactly once when the reader is no longer needed (extra Release
+// calls are harmless no-ops). The reader may be shared with other goroutines;
+// use ReadAt only — ScanAll seeks and is not safe on a shared reader.
 //
 // The cache miss opens the file while holding the cache lock. That is one
 // CreateFile plus a 38-byte read on the light path, and opening outside the
 // lock would let a miss race Purge's dead-set check and resurrect a file that
 // is about to be unlinked.
-func (c *Cache) Acquire(id uint64) (*Reader, func() error, error) {
+func (c *Cache) Acquire(id uint64) (*Reader, *Release, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -119,7 +170,7 @@ func (c *Cache) Acquire(id uint64) (*Reader, func() error, error) {
 	if e, ok := c.entries[id]; ok {
 		c.lru.MoveToFront(e.elem)
 		e.refs++
-		return e.reader, releaseFunc(c, e), nil
+		return e.reader, releaseHandle(c, e), nil
 	}
 
 	reader, err := OpenReaderLight(SegmentPath(c.segmentDir, id))
@@ -130,19 +181,7 @@ func (c *Cache) Acquire(id uint64) (*Reader, func() error, error) {
 	e.elem = c.lru.PushFront(e)
 	c.entries[id] = e
 	c.evictOverflowLocked()
-	return e.reader, releaseFunc(c, e), nil
-}
-
-// releaseFunc wraps release so a handed-out release function is idempotent:
-// callers defer it and must not have to reason about double-release corrupting
-// the refcount.
-func releaseFunc(c *Cache, e *cacheEntry) func() error {
-	var once sync.Once
-	return func() error {
-		var err error
-		once.Do(func() { err = c.release(e) })
-		return err
-	}
+	return e.reader, releaseHandle(c, e), nil
 }
 
 func (c *Cache) release(e *cacheEntry) error {

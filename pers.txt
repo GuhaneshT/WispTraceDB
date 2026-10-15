@@ -46,3 +46,102 @@ Study Material:
 Understanding Go's sync.Pool
 Zero-Allocation Iterators in Go
 Keywords for research: "Golang zero allocation iterator", "sync.Pool database cursor pattern".
+
+================================================================================
+5. VERIFICATION AGAINST SOURCE (added after reading the code)
+================================================================================
+The three diagnoses above are directionally right. Two of the three have the wrong
+root cause, and the fix follows from the correction. Verified by reading the code,
+not by profiling — so treat the root causes as strong hypotheses confirmed by
+inspection, and the specific attribution of B/op between causes as unverified.
+
+--- Finding 1: Ingest. CORRECT. ---
+
+Re "lock contention and sequential I/O throttling" — correct, and the ratio
+confirms it: 373.2us sequential vs 356.7us parallel = 0.956x, i.e. 5% for 12
+concurrent writers. That is zero scaling, which is the signature of a serialized
+fsync, not of a lock that could be narrowed.
+
+Precise mechanism (cmd/cmd.go:438 InsertSpan -> wal.AppendRecord, which fsyncs before
+returning, under a mutex). Note wal.go takes its encoding buffer from a sync.Pool
+*before* taking the mutex, so the pool is not the serialization point. The fsync is.
+
+Fix remains WAL group commit. One design note that makes it cheaper than usual: the
+system promises no ordering across concurrent writers, and appends are already
+serialized, so batching N appends into one fsync preserves every guarantee actually
+offered. If we had promised cross-writer ordering this would be a hard problem.
+
+--- Finding 2: GetSpan. SYMPTOM RIGHT, ROOT CAUSE WRONG. ---
+
+The suggested fix is an fd LRU cache. That is treating the symptom. The actual
+defect is a layering violation, and there are two distinct costs, not one:
+
+  (a) cmd/cmd.go:807-811 — GetSpan calls segment.OpenReader() and defer
+      reader.Close() on every single point lookup. So one os.Open/os.Close per
+      lookup. This is the cost an fd cache would fix. Real, but the smaller half.
+
+  (b) segment/reader.go:22 OpenReader — readBlooms() reads the entire bloom
+      section into a fresh buffer and decodes all FIVE filters into a map on every
+      open. A point lookup has an exact (segment_id, offset) from the index and
+      consults none of them. Blooms exist for RangeQuery pruning (cmd/cmd.go:943).
+
+(b) is the bigger half and an fd cache does nothing about it — it would cache a
+bloom section that should never have been decoded. This is the 14.5 KB.
+
+Correct fix: a point-lookup-only read path that opens the file and reads framing +
+payload without touching the header's bloom length, plus an fd reuse/cache across
+calls. (a) is a cache; (b) is a missing entry point.
+
+Proof we already knew the pattern: GetTrace (cmd/cmd.go:831-844) already builds a
+per-segment reader map to avoid reopening per span. The fix is known and written —
+it just was not applied to the point path.
+
+--- Finding 3: RangeQuery. SYMPTOM RIGHT, BUT MISATTRIBUTED. ---
+
+13228 allocs / 743 KB for a query returning ~100 spans is real and bad. The stated
+cause — a heap-allocated wal.SpanPayload per scanned row — is the right *kind* of
+answer but the wrong target. Per-row cost is 25.2us and ~132 allocs per returned
+span, which is far too high to be payload-struct allocation alone.
+
+Dominant cause is the same defect as (2), multiplied across segments: to return ~100
+spans spread over ~10 segments the scan opens ~10 files and decodes ~50 bloom
+filters. The setup cost exceeds the scan cost. At this dataset size the bloom
+pruning is not earning its keep — the metadata it reads to decide what to skip costs
+more to load than the skipping saves. This is the risk PAD1 section 5 predicted
+("query time scales with segment count"), but the scaling is in the *opening*, not
+in the *pruning*.
+
+Secondary cause is still per-row allocation (see below) and the iterator pattern is
+still the right fix for that part.
+
+--- Cross-cutting: what these benchmarks do NOT measure ---
+
+  - Compaction is not exercised. SegmentFlushThreshold=1000 puts GetSpan at ~5 and
+    RangeQuery at ~10 live segments against a default compaction threshold of 10, so
+    whether inline compaction triggers is marginal and uninstrumented. The staleness
+    check's per-scanned-span index.GetSpan cost is therefore UNMEASURED. This is the
+    most important gap.
+  - Retention expiry: never runs (7-day cutoff, 50s benchmark).
+  - Recovery cost as the checkpoint tail grows: unmeasured, and this is the number
+    that motivated promoting the checkpoint into v1.
+  - Read-path concurrency: all query benchmarks are single-goroutine on an idle box.
+    GetTrace and RangeQuery both take locks; behaviour under concurrent read load
+    is unknown.
+  - Dataset is small and uniform: 5-10k spans, one agent/model/tool, 35-byte
+    payload. No cardinality growth, no zone-map pruning that actually prunes, no
+    segment large enough for the row-vs-columnar question to register.
+  - Hardware: i7-1250U (low-power laptop part), Windows, 12 threads, ~50s total.
+    Absolute numbers are environment-limited; only the ratios generalize.
+
+--- Recommended order of work (revised) ---
+
+  1. Measure compaction. It is the biggest unmeasured surface and the staleness
+     check is the one per-span cost the design knowingly accepted.
+  2. Add the point-lookup read path (finding 2b) — biggest measured win per line.
+  3. WAL group commit (finding 1) — converts ingest from disk-bound to
+     batched, and the design already made it safe.
+  4. Re-measure. Fix 2 changes the read path enough that 3 and 4 interact.
+  5. Zero-alloc scan iterator (finding 3, secondary) — real, but do it after the
+     setup cost is gone or it will be optimizing the smaller half again.
+  6. Columnar segments: still last. At this scale the format is not the bottleneck;
+     the open/decode overhead above it is roughly an order of magnitude larger.

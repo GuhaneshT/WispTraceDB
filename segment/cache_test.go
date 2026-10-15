@@ -30,7 +30,7 @@ func writeCacheFixture(t *testing.T, dir string, id uint64) uint64 {
 	return res.Offsets[CompositeKey("tr", "sp")]
 }
 
-func mustAcquire(t *testing.T, c *Cache, id uint64) (*Reader, func() error) {
+func mustAcquire(t *testing.T, c *Cache, id uint64) (*Reader, *Release) {
 	t.Helper()
 	r, rel, err := c.Acquire(id)
 	if err != nil {
@@ -46,9 +46,9 @@ func TestCacheAcquireHitReturnsSameReader(t *testing.T) {
 	defer c.Close()
 
 	r1, rel1 := mustAcquire(t, c, 1)
-	rel1()
+	rel1.Release()
 	r2, rel2 := mustAcquire(t, c, 1)
-	defer rel2()
+	defer rel2.Release()
 
 	if r1 != r2 {
 		t.Fatal("second Acquire returned a different reader; hit path is not reusing the cached handle")
@@ -65,7 +65,7 @@ func TestCachePurgedIDIsNeverReopened(t *testing.T) {
 	defer c.Close()
 
 	r, rel := mustAcquire(t, c, 1)
-	rel()
+	rel.Release()
 
 	if err := c.Purge([]uint64{1}); err != nil {
 		t.Fatalf("Purge: %v", err)
@@ -112,7 +112,7 @@ func TestCachePurgeWaitsForInflightReader(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	rel()
+	rel.Release()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -144,7 +144,7 @@ func TestCachePurgeTimesOutInsteadOfClosingHeldReader(t *testing.T) {
 		t.Fatalf("Purge timeout took %s, expected ~%s", elapsed, c.purgeWait)
 	}
 	// The entry was still detached, so the last release closes it.
-	if err := rel(); err != nil {
+	if err := rel.Release(); err != nil {
 		t.Fatalf("release after timed-out purge: %v", err)
 	}
 	// And the dead set still refuses reopen even though the purge timed out.
@@ -162,9 +162,9 @@ func TestCacheEvictsLeastRecentlyUsedIdleEntry(t *testing.T) {
 	defer c.Close()
 
 	r1, rel1 := mustAcquire(t, c, 1)
-	rel1()
+	rel1.Release()
 	r2, rel2 := mustAcquire(t, c, 2)
-	rel2()
+	rel2.Release()
 	// Touch id 1: id 2 is now the least recently used.
 	if r, rel, err := c.Acquire(1); err != nil {
 		t.Fatalf("Acquire(1): %v", err)
@@ -172,15 +172,15 @@ func TestCacheEvictsLeastRecentlyUsedIdleEntry(t *testing.T) {
 		if r != r1 {
 			t.Fatal("Acquire(1) before eviction returned a different reader")
 		}
-		rel()
+		rel.Release()
 	}
 
 	// Insert a third entry: overflow evicts id 2 (LRU, idle).
 	_, rel3 := mustAcquire(t, c, 3)
-	rel3()
+	rel3.Release()
 
 	r2b, rel2b := mustAcquire(t, c, 2)
-	defer rel2b()
+	defer rel2b.Release()
 	// The evicted entry's reader was closed, so this must be a fresh open of
 	// the same file — a different reader object.
 	if r2b == r2 {
@@ -206,14 +206,14 @@ func TestCacheEvictionSkipsInUseEntry(t *testing.T) {
 	r2, rel2 := mustAcquire(t, c, 2)
 
 	r1b, rel1b := mustAcquire(t, c, 1)
-	defer rel1b()
+	defer rel1b.Release()
 	r2b, rel2b := mustAcquire(t, c, 2)
-	defer rel2b()
+	defer rel2b.Release()
 	if r1b != r1 || r2b != r2 {
 		t.Fatal("in-use entries were evicted despite maxEntries pressure")
 	}
-	rel1()
-	rel2()
+	rel1.Release()
+	rel2.Release()
 }
 
 func TestCacheDoubleReleaseIsHarmless(t *testing.T) {
@@ -223,10 +223,10 @@ func TestCacheDoubleReleaseIsHarmless(t *testing.T) {
 	defer c.Close()
 
 	_, rel := mustAcquire(t, c, 1)
-	if err := rel(); err != nil {
+	if err := rel.Release(); err != nil {
 		t.Fatalf("first release: %v", err)
 	}
-	if err := rel(); err != nil {
+	if err := rel.Release(); err != nil {
 		t.Fatalf("second release must be a no-op, got %v", err)
 	}
 	// Refcount is exactly 0, so purge can complete without waiting.
@@ -241,7 +241,7 @@ func TestCacheCloseClosesIdleReadersAndRejectsAcquire(t *testing.T) {
 	c := NewCache(dir, 4)
 
 	r, rel := mustAcquire(t, c, 1)
-	rel()
+	rel.Release()
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -275,7 +275,7 @@ func TestCacheCloseForceClosesInflightReader(t *testing.T) {
 		t.Fatalf("Close took %s with an in-flight reader; it must not hang", elapsed)
 	}
 	// Late release after force-close must not panic or double-close.
-	if err := rel(); err != nil {
+	if err := rel.Release(); err != nil {
 		t.Fatalf("late release: %v", err)
 	}
 }
@@ -304,7 +304,7 @@ func TestCacheConcurrentAcquireRelease(t *testing.T) {
 				if _, err := r.ReadAt(offsets[id]); err != nil {
 					t.Errorf("ReadAt on shared reader: %v", err)
 				}
-				if err := rel(); err != nil {
+				if err := rel.Release(); err != nil {
 					t.Errorf("release: %v", err)
 					return
 				}
