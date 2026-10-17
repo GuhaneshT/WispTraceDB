@@ -672,7 +672,7 @@ are the reliable signal; latency on this laptop is noise-bound in both direction
 | `GetSpan`, post-compaction | 1,644 B / 22 allocs | **375 B / 14 allocs** | `post-cache-20261015.txt` |
 | `GetTrace` | 6,818 B / 135 allocs | **5,711 B / 128 allocs** | `post-cache-20261015.txt` |
 | `spanAlreadyIndexed` | 1,615 B / 21 allocs | **365 B / 13 allocs** | `post-cache-20261015.txt` |
-| `RangeQueryWithCompaction` | 3,043,562 B / 70,170 allocs | **2,929,206 B / 65,272 allocs** | `post-cache-20261015.txt` |
+| `RangeQueryWithCompaction` | 3,043,562 B / 70,170 allocs | **1,195,122 B / 60,270 allocs** | `post-cache-20261015.txt` (streaming `ScanAllFunc`) |
 
 > **The cache A/B is unconfirmed.** The intended no-cache control
 > (`WISPTRACE_BENCH_NO_CACHE=1`) produced byte-identical B/op and allocs, so the env

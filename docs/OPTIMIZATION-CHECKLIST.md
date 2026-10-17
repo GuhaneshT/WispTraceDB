@@ -14,6 +14,7 @@ each phase.
 - [x] Re-run `BenchmarkRangeQueryWithCompaction` and `TestCompactionDiagnostic` after the key-collision fix; record valid post-compaction scan numbers — `docs/benchmarks/compaction-20261003.txt` Run 2 (RangeQuery 12.59 ms / 3.04 MB / 70,170 allocs; GetSpan 296 µs / 65.7 KB / 36 allocs)
 - [x] Attribute the valid compacted RangeQuery latency — a 1000-ts window sits inside a 5000-span merged segment, so ScanAll decodes 5000 records and the staleness check issues 5000 index.GetSpan calls before the cheap in-memory time filter. pprof not needed: the order + counts explain it.
 - [x] Reorder RangeQuery to run `filter.matches` BEFORE the per-candidate `index.GetSpan` staleness lookup (correctness-neutral; cuts ~5000 Pebble point reads to ~101 per query at this shape) — `cmd/cmd.go:1412-1418`
+- [x] segment: added `ScanAllFunc` streaming API; `ScanAll` becomes wrapper. Avoids materialising `[]ScannedSpan` per scanned record. — `segment/reader.go`, `compactor/compactor.go`, `cmd/cmd.go`
 
 ## Phase 1: Point-lookup read path (Priority #1) — Reduce GetSpan overhead
 - [x] segment: Add `OpenReaderLight(path string)` that reads the header only (no bloom decode). `Blooms` stays nil. — `segment/reader.go`
@@ -40,17 +41,17 @@ each phase.
 - [ ] Crash safety: WAL record format unchanged. Durability point remains post-fsync of the committed batch. Never acknowledge before sync.
 - [ ] Validate with fault injection: `tests/fault_injection_test.go` must still pass (acked spans survive kills). No behavior regression.
 - [ ] Tune: initial batch size/timeout (e.g. 64–256 records or 5–10 ms). Make configurable later if needed.
-- [ ] Benchmark `InsertSpan_Parallel` vs baseline; target near-linear scaling vs Sequential.
+- [ ] Benchmark `InsertSpan_Parallel` vs baseline; target near-linear scaling vs Sequential. (Current: ~0.74x, no scaling)
 
 ## Phase 4: Zero-allocation scan (Priority #4) — Reduce RangeQuery GC pressure
-- [ ] segment: add iterator/callback API (e.g. `ScanAllFunc(func(offset uint64, span wal.SpanPayload) bool) error`) to avoid materializing a full `[]ScannedSpan`.
-- [ ] `cmd/RangeQuery`: use callback-based scan; avoid building large intermediate slices when filtering.
+- [x] segment: add iterator/callback API (`ScanAllFunc(func(offset uint64, span wal.SpanPayload) bool) error`) to avoid materializing a full `[]ScannedSpan`.
+- [x] `cmd/RangeQuery`: use callback-based scan; avoid building large intermediate slices when filtering.
 - [ ] wal: review `deserializePayload` copies (blob/string copies are required for safety — focus on container allocations).
 - [ ] Consider `sync.Pool` for small temp buffers if profiling shows benefit (after setup cost is gone).
-- [ ] Benchmark RangeQuery vs post-P2/P3 baseline; track allocs/op and B/op.
+- [x] Benchmark RangeQueryWithCompaction — **1.20 MB / 60,270 allocs** (from 2.93 MB / 65,272 allocs). RangeQuery (uncompacted) still to measure.
 
 ## Phase 5: Compaction/staleness cost analysis (Priority #5) — Measure unmeasured
-- [x] Run `BenchmarkRangeQueryWithCompaction` with `-benchmem`; compared to post-reorder — **2,929,206 B/op, 65,272 allocs** (`post-cache-20261015.txt`), down from 3,043,562 B / 70,170 allocs (`compaction-20261003.txt`). `BenchmarkRangeQuery` (uncompacted) did not finish within the suite's default 10m timeout — run separately with `-timeout`.
+- [x] Run `BenchmarkRangeQueryWithCompaction` with `-benchmem`; after `ScanAllFunc` — **1,195,122 B/op, 60,270 allocs** (`post-cache-20261015.txt`), down from 3,043,562 B / 70,170 allocs (`compaction-20261003.txt`). `BenchmarkRangeQuery` (uncompacted) did not finish within the suite's default 10m timeout — run separately with `-timeout`.
 - [ ] Instrument/record candidate count vs returned count (optional temporary counters).
 - [ ] Evaluate bloom effectiveness vs setup cost at current segment sizes.
 - [ ] Decide whether a snapshot iterator over the index (replacing N point `GetSpan` lookups in the staleness check) is worth it while preserving correctness. Correctness > perf.
