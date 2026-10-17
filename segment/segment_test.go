@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -137,6 +138,104 @@ func TestReaderScanAllReturnsEverySpanInOrder(t *testing.T) {
 		}
 		if got.SpanID != want.SpanID {
 			t.Fatalf("ReadAt(scanned offset) SpanID = %s, want %s", got.SpanID, want.SpanID)
+		}
+	}
+}
+
+func TestScanAllFuncStreamsInOrderAndStopsEarly(t *testing.T) {
+	dir := t.TempDir()
+	w := NewWriter()
+	spans := []wal.SpanPayload{
+		makeSpan("trace-1", "span-1", 100),
+		makeSpan("trace-1", "span-2", 105),
+		makeSpan("trace-1", "span-3", 110),
+	}
+	for _, s := range spans {
+		w.Add(s)
+	}
+	result, err := w.Flush(dir, 3)
+	if err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	reader, err := OpenReader(result.Path)
+	if err != nil {
+		t.Fatalf("OpenReader() error = %v", err)
+	}
+	defer reader.Close()
+
+	// Retain every span to prove the reused read buffer does not alias into the
+	// decoded structs: each field must still hold its own copy after the walk
+	// has moved on to the next record.
+	var seen []ScannedSpan
+	err = reader.ScanAllFunc(func(offset uint64, span wal.SpanPayload) bool {
+		seen = append(seen, ScannedSpan{Offset: offset, Span: span})
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ScanAllFunc() error = %v", err)
+	}
+	if len(seen) != len(spans) {
+		t.Fatalf("ScanAllFunc() visited %d records, want %d", len(seen), len(spans))
+	}
+	for i, want := range spans {
+		if seen[i].Span.SpanID != want.SpanID || seen[i].Span.TraceID != want.TraceID {
+			t.Fatalf("record %d = %s/%s, want %s/%s", i, seen[i].Span.TraceID, seen[i].Span.SpanID, want.TraceID, want.SpanID)
+		}
+		if string(seen[i].Span.Payload) != string(want.Payload) {
+			t.Fatalf("record %d payload = %q, want %q (reused read buffer leaked into a retained span)", i, seen[i].Span.Payload, want.Payload)
+		}
+	}
+
+	// Early stop: fn returns false on the first record, so no further records
+	// are visited.
+	visited := 0
+	if err := reader.ScanAllFunc(func(offset uint64, span wal.SpanPayload) bool {
+		visited++
+		return false
+	}); err != nil {
+		t.Fatalf("ScanAllFunc() early-stop error = %v", err)
+	}
+	if visited != 1 {
+		t.Fatalf("early-stop visited %d records, want 1", visited)
+	}
+}
+
+func TestScanAllFuncMatchesScanAll(t *testing.T) {
+	dir := t.TempDir()
+	w := NewWriter()
+	for i := 0; i < 5; i++ {
+		w.Add(makeSpan("t", fmt.Sprintf("s-%d", i), int64(100+i)))
+	}
+	result, err := w.Flush(dir, 1)
+	if err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	reader, err := OpenReader(result.Path)
+	if err != nil {
+		t.Fatalf("OpenReader() error = %v", err)
+	}
+	defer reader.Close()
+
+	all, err := reader.ScanAll()
+	if err != nil {
+		t.Fatalf("ScanAll() error = %v", err)
+	}
+	var streamed []ScannedSpan
+	if err := reader.ScanAllFunc(func(offset uint64, span wal.SpanPayload) bool {
+		streamed = append(streamed, ScannedSpan{Offset: offset, Span: span})
+		return true
+	}); err != nil {
+		t.Fatalf("ScanAllFunc() error = %v", err)
+	}
+	if len(streamed) != len(all) {
+		t.Fatalf("ScanAllFunc len = %d, ScanAll len = %d", len(streamed), len(all))
+	}
+	for i := range all {
+		if all[i].Offset != streamed[i].Offset || all[i].Span.SpanID != streamed[i].Span.SpanID {
+			t.Fatalf("record %d differs: ScanAll offset=%d span=%s, ScanAllFunc offset=%d span=%s",
+				i, all[i].Offset, all[i].Span.SpanID, streamed[i].Offset, streamed[i].Span.SpanID)
 		}
 	}
 }

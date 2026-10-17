@@ -660,25 +660,38 @@ characteristics. **The ratios are the findings.**
 > any of these numbers — they are retained below for the shape of each problem, not as
 > current evidence.
 
-### Recorded read-path numbers after the P1/P1b fixes
+### Recorded read-path numbers after the P1/P1b/cache fixes
 
-The three exact-offset callers now use `OpenReaderLight` (and the reader cache), each
-measured before/after. Bytes are the reliable signal; latency on this laptop is
-noise-bound in both directions.
+The three exact-offset callers use `OpenReaderLight` and, since Oct 2026, the
+`segment.Cache` with its pooled `*segment.Release`, each measured before/after. Bytes
+are the reliable signal; latency on this laptop is noise-bound in both directions.
 
-| Path | Before | After | Source |
+| Path | Before (light open) | After (cache) | Source |
 |---|---|---|---|
-| `GetSpan` | 14,547 B / 35 allocs | **1,581 B / 22 allocs** | `post-p1-20261003.txt` |
-| `GetSpan`, post-compaction | 65,684 B / 36 allocs | **1,644 B / 22 allocs** | `post-p1-20261003.txt` |
-| `GetTrace` | 19,836 B / 148 allocs | **6,818 B / 135 allocs** | `post-p1b-20261006.txt` |
-| `spanAlreadyIndexed` | 14,591 B / 34 allocs | **1,615 B / 21 allocs** | `post-p1b-20261006.txt` |
+| `GetSpan` | 1,581 B / 22 allocs | **386 B / 14 allocs** | `post-cache-20261015.txt` |
+| `GetSpan`, post-compaction | 1,644 B / 22 allocs | **375 B / 14 allocs** | `post-cache-20261015.txt` |
+| `GetTrace` | 6,818 B / 135 allocs | **5,711 B / 128 allocs** | `post-cache-20261015.txt` |
+| `spanAlreadyIndexed` | 1,615 B / 21 allocs | **365 B / 13 allocs** | `post-cache-20261015.txt` |
+| `RangeQueryWithCompaction` | 3,043,562 B / 70,170 allocs | **2,929,206 B / 65,272 allocs** | `post-cache-20261015.txt` |
 
-Compaction remains unbenchmarked, and `RangeQuery` still carries the per-candidate
-staleness lookup and the per-query open/bloom-decode setup.
+> **The cache A/B is unconfirmed.** The intended no-cache control
+> (`WISPTRACE_BENCH_NO_CACHE=1`) produced byte-identical B/op and allocs, so the env
+> var never reached the test binary and the direct-open baseline for these numbers is
+> missing. The deltas above are real (same host, same benchmark) but the attribution to
+> the cache specifically is inferred, not measured.
 
-### Parallel insert scales 0.956x
+Compaction is now benchmarked (`RangeQueryWithCompaction`, `GetSpanWithCompaction`), but
+`RangeQuery` itself still carries the per-candidate staleness lookup and the per-query
+open/bloom-decode setup, and did not complete inside the suite's default 10m timeout
+— run it separately.
 
-12 threads delivering 5% over one. Not "modest scaling" — effectively none.
+### Parallel insert does not scale (~0.74x)
+
+Latest run: median 1.21 ms/op parallel vs 0.89 ms/op sequential — 12 threads
+delivering *less* than one. The earlier 0.956x figure is superseded; the two runs'
+ranges overlap, so the honest statement is "no scaling, plausibly slight
+contention", not a precise ratio. Either way it is not "modest scaling" — it is
+none.
 
 The cause is exactly the designed behaviour: `InsertSpan` fsyncs the WAL before
 acknowledging, under a mutex. The ack *is* the fsync, so throughput is capped at disk
@@ -703,34 +716,36 @@ happily cache a bloom section that should never have been decoded. The real fix 
 **missing entry point**: open the segment and read one record, without materialising
 pruning metadata.
 
-### `RangeQuery` ≈ 132 allocs per returned span — **NOW STALE, RE-MEASURE REQUIRED**
+### `RangeQuery` on merged segments — **now measured** (`post-cache-20261015.txt`)
 
-> **These numbers predate the deletion fix and no longer describe the code.**
-> `RangeQuery` now issues one Pebble index lookup per surviving candidate, to re-verify
-> liveness against the index (Finding 2b). Both the allocation count and the wall-clock
-> figure below are therefore optimistic. `cmd/benchmark_test.go` must be re-run before any
-> of this is quoted. What follows is retained to explain the *shape* of the problem, which
-> the deletion fix makes worse rather than removes.
+`BenchmarkRangeQueryWithCompaction` (15,000 spans, merged segments, a 1000-ts window
+returning ~101 spans) costs **~2.93 MB and ~65,272 allocs per query**. Cost is not per
+returned span — it is per *scanned* record. `ScanAll` (`segment/reader.go`) materialises
+every record in every segment the time range crosses, and the ~65k allocs ÷ ~5,000
+scanned records is the decode cost; the ~101 that match are a rounding error.
 
-To return ~100 spans across ~10 segments it opens ~10 files and decodes ~50 bloom
-filters. Setup exceeds the scan. **The bloom pruning is not earning its keep at this
-scale** — the overhead of loading it exceeds the work of not needing it.
+The older "≈132 allocs per returned span" figure is superseded. The shape is unchanged
+from the diagnosis below; only the magnitude and the point at which the cost sits have
+been pinned down. Two follow-ups remain:
 
-Note both prunings run *after* `OpenReader`, so the zone map cannot save the bloom
-decode. Reading the header alone would let the zone map prune before any bloom work.
+- **the index re-verification** is per-*candidate*. The filter-before-staleness reorder
+  is now applied (`cmd.RangeQuery` runs `filter.matches` before `index.GetSpan`), which
+  removed roughly one Pebble point lookup per *scanned* record — the ~4,900-alloc drop
+  from 70,170 to 65,272. The deeper fix, one Pebble snapshot iterator with `SeekGE`
+  per key instead of N independent `Get`s, is still not attempted: new API on the index
+  wrapper.
+- **`ScanAll` materialisation** is now the dominant term. An iterator-based scan that
+  filters as it reads, instead of building a `[]ScannedSpan` of everything, is the next
+  fix and is not done.
 
-The per-candidate index lookup now stacks on top of this. The two costs have different
-shapes and want different fixes:
+`RangeQuery` (uncompacted) did not complete inside the benchmark suite's default 10m
+timeout — the suite is dominated by fsync-bound preload inserts, so run that benchmark
+on its own with `-timeout`.
 
-- **bloom decode** is per-*segment*, and is wasted entirely on a point lookup. Fix is a
-  read path that does not materialise pruning metadata (see above).
-- **the index re-verification** is per-*candidate*, and is the price of correctness. Fix
-  is one Pebble snapshot iterator with `SeekGE` per key instead of N independent `Get`s,
-  which collapses N random point lookups into one ordered walk. That is new API on the
-  index wrapper and is deliberately not attempted here.
-
-Both are unmeasured. Neither should be quoted as a number until `benchmark_test.go` has
-been re-run against the fixed code.
+**The bloom-pruning observation from the original analysis still stands:** to return
+~100 spans it opens ~10 files and decodes ~50 bloom filters, and both prunings run
+*after* `OpenReader`, so the zone map cannot save the bloom decode. At this scale the
+bloom pruning does not obviously earn its keep.
 
 ### The instructive bug in this defect
 
@@ -744,11 +759,14 @@ do the union of their work for both. The expensive caller keeps paying; the chea
 caller starts paying too, one callee at a time, and nobody notices because the shared
 function cannot be obviously wrong.
 
-### Unmeasured: compaction
+### Compaction — now measured
 
-Nothing in the benchmark suite exercises compaction, so the staleness check's
-per-scanned-span index lookup has no number at all. This is the largest known hole in
-the performance picture.
+`BenchmarkRangeQueryWithCompaction` and `BenchmarkGetSpanWithCompaction` exercise a
+post-merge segment set (see `docs/benchmarks/compaction-20261003.txt` and
+`post-cache-20261015.txt`). The staleness check's cost was the ~4,900-alloc index-lookup
+term removed by the filter-before-staleness reorder; what remains is `ScanAll`
+materialisation, above. What is still missing is a *compaction* timing (CPU/I-O/write
+amplification of the merge itself), which no benchmark currently records.
 
 ---
 
@@ -987,10 +1005,10 @@ instead of returning 5 names. Same in `GetDistinctTeams` and `GetDistinctAgents`
 numeric offset. Two consequences:
 
 - **Cost is O(total) per page**, not O(page).
-- The cursor is a position in a result set whose *composition* changes whenever a
-  segment flush or compacts between pages. Segments are appended and merged
-  concurrently with pagination, so a client paging through results can skip spans or
-  see them twice.
+- The cursor is a numeric offset into a freshly re-computed result set whose
+  composition changes whenever a segment flush or compaction occurs between pages.
+  Segments are appended and merged concurrently with pagination, so a client paging
+  through results can skip spans or see them twice. It is not a stable snapshot.
 
 Not a crash-safety issue, but the cursor is not a stable snapshot and should not be
 documented as one.

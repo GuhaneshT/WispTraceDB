@@ -89,12 +89,8 @@ func (c *Compactor) Compact(oldIDs []uint64, newSegmentID uint64) (*Result, erro
 	staleCount := 0
 
 	for _, id := range oldIDs {
-		spans, err := scanSegment(c.segmentDir, id)
-		if err != nil {
-			return nil, err
-		}
-		for _, s := range spans {
-			key := segment.CompositeKey(s.Span.TraceID, s.Span.SpanID)
+		err := scanSegment(c.segmentDir, id, func(offset uint64, s wal.SpanPayload) bool {
+			key := segment.CompositeKey(s.TraceID, s.SpanID)
 
 			// Staleness check, and it must run BEFORE the tombstone test. Pebble
 			// holds exactly one (segment_id, offset) per key with no
@@ -112,20 +108,24 @@ func (c *Compactor) Compact(oldIDs []uint64, newSegmentID uint64) (*Result, erro
 			// record is classified stale. That is correct — it is already dead and
 			// there is nothing to clean up.
 			current, err := c.index.GetSpan([]byte(key))
-			if err != nil || current.SegmentID != id || current.Offset != s.Offset {
+			if err != nil || current.SegmentID != id || current.Offset != offset {
 				staleCount++
-				continue
+				return true
 			}
 
 			// The index points at this record and the record is a tombstone: it
 			// is the authoritative delete, so reclaim the key and never carry
 			// the tombstone into a merged segment.
-			if s.Span.Deleted {
+			if s.Deleted {
 				droppedCount++
 				reclaimKeys = append(reclaimKeys, key)
-				continue
+				return true
 			}
-			survivors = append(survivors, s.Span)
+			survivors = append(survivors, s)
+			return true
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -209,28 +209,28 @@ func (c *Compactor) Expire(candidateIDs []uint64, cutoff int64) (*Result, error)
 			reader.Close()
 			continue
 		}
-		spans, err := reader.ScanAll()
+		scanErr := reader.ScanAllFunc(func(offset uint64, s wal.SpanPayload) bool {
+			key := segment.CompositeKey(s.TraceID, s.SpanID)
+
+			current, err := c.index.GetSpan([]byte(key))
+			if err != nil || current.SegmentID != id || current.Offset != offset {
+				staleCount++
+				return true
+			}
+
+			droppedCount++
+			reclaimKeys = append(reclaimKeys, key)
+			return true
+		})
 		closeErr := reader.Close()
-		if err != nil {
-			return nil, fmt.Errorf("scan segment %d: %w", id, err)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan segment %d: %w", id, scanErr)
 		}
 		if closeErr != nil {
 			return nil, fmt.Errorf("close segment %d reader: %w", id, closeErr)
 		}
 
 		expiredIDs = append(expiredIDs, id)
-		for _, s := range spans {
-			key := segment.CompositeKey(s.Span.TraceID, s.Span.SpanID)
-
-			current, err := c.index.GetSpan([]byte(key))
-			if err != nil || current.SegmentID != id || current.Offset != s.Offset {
-				staleCount++
-				continue
-			}
-
-			droppedCount++
-			reclaimKeys = append(reclaimKeys, key)
-		}
 	}
 
 	if len(expiredIDs) == 0 {
@@ -260,20 +260,23 @@ func (c *Compactor) Expire(candidateIDs []uint64, cutoff int64) (*Result, error)
 	return result, nil
 }
 
-func scanSegment(dir string, id uint64) ([]segment.ScannedSpan, error) {
+// scanSegment opens segment id and streams every record through fn, closing
+// the reader before returning. It uses ScanAllFunc rather than ScanAll so a
+// merge does not materialise a ScannedSpan slice for the whole segment.
+func scanSegment(dir string, id uint64, fn func(offset uint64, span wal.SpanPayload) bool) error {
 	reader, err := segment.OpenReader(segment.SegmentPath(dir, id))
 	if err != nil {
-		return nil, fmt.Errorf("open segment %d: %w", id, err)
+		return fmt.Errorf("open segment %d: %w", id, err)
 	}
-	spans, err := reader.ScanAll()
+	scanErr := reader.ScanAllFunc(fn)
 	closeErr := reader.Close()
-	if err != nil {
-		return nil, fmt.Errorf("scan segment %d: %w", id, err)
+	if scanErr != nil {
+		return fmt.Errorf("scan segment %d: %w", id, scanErr)
 	}
 	if closeErr != nil {
-		return nil, fmt.Errorf("close segment %d reader: %w", id, closeErr)
+		return fmt.Errorf("close segment %d reader: %w", id, closeErr)
 	}
-	return spans, nil
+	return nil
 }
 
 // removeOrphan deletes a newly-written segment that a later step failed to

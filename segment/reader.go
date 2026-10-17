@@ -96,44 +96,77 @@ type ScannedSpan struct {
 }
 
 // ScanAll reads every span record in the segment sequentially, starting
-// right after the header and bloom-filter section, through EOF.
+// right after the header and bloom-filter section, through EOF, and returns
+// them as a slice. Prefer ScanAllFunc when the caller will filter as it goes:
+// this form materialises a ScannedSpan (which embeds a whole SpanPayload, so
+// strings, blob, and all) for every record in the segment.
 func (r *Reader) ScanAll() ([]ScannedSpan, error) {
+	spans := make([]ScannedSpan, 0, r.Header.SpanCount)
+	err := r.ScanAllFunc(func(offset uint64, span wal.SpanPayload) bool {
+		spans = append(spans, ScannedSpan{Offset: offset, Span: span})
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return spans, nil
+}
+
+// ScanAllFunc walks every span record in the segment sequentially, starting
+// right after the header and bloom-filter section, and calls fn once per
+// record with its byte offset and decoded span. If fn returns false the walk
+// stops immediately and ScanAllFunc returns nil. A read, checksum, or decode
+// failure returns an error.
+//
+// Unlike ScanAll it never builds a []ScannedSpan, so callers that filter while
+// scanning (RangeQuery, compaction) do not materialise every record in the
+// segment only to discard most of them. The read buffer is reused across
+// records: the WAL decoder copies every field out of it (it explicitly does
+// not pin the read buffer), so the span handed to fn is fully owned and may be
+// retained. Note the decode itself still allocates per record — this removes
+// the slice and the read buffer, not the field copies a decode makes.
+func (r *Reader) ScanAllFunc(fn func(offset uint64, span wal.SpanPayload) bool) error {
 	start := int64(headerSize) + int64(r.Header.BloomSectionLength)
 	if _, err := r.file.Seek(start, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek past segment header/bloom section: %w", err)
+		return fmt.Errorf("seek past segment header/bloom section: %w", err)
 	}
 	reader := bufio.NewReader(r.file)
 
-	spans := make([]ScannedSpan, 0, r.Header.SpanCount)
+	var buf []byte
 	offset := uint64(start)
 	for {
 		var framing [recordFramingSize]byte
 		if _, err := io.ReadFull(reader, framing[:]); err != nil {
 			if err == io.EOF {
-				break
+				return nil
 			}
-			return nil, fmt.Errorf("scan segment: read framing at offset %d: %w", offset, err)
+			return fmt.Errorf("scan segment: read framing at offset %d: %w", offset, err)
 		}
 		length := binary.LittleEndian.Uint32(framing[0:4])
 		checksum := binary.LittleEndian.Uint32(framing[4:8])
 
-		payload := make([]byte, length)
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			return nil, fmt.Errorf("scan segment: read payload at offset %d: %w", offset, err)
+		if cap(buf) < int(length) {
+			buf = make([]byte, length)
+		} else {
+			buf = buf[:length]
 		}
-		if crc32.ChecksumIEEE(payload) != checksum {
-			return nil, fmt.Errorf("segment record checksum mismatch at offset %d", offset)
+		if _, err := io.ReadFull(reader, buf); err != nil {
+			return fmt.Errorf("scan segment: read payload at offset %d: %w", offset, err)
+		}
+		if crc32.ChecksumIEEE(buf) != checksum {
+			return fmt.Errorf("segment record checksum mismatch at offset %d", offset)
 		}
 
-		span, err := wal.DecodeSpanPayload(payload)
+		span, err := wal.DecodeSpanPayload(buf)
 		if err != nil {
-			return nil, fmt.Errorf("decode span at offset %d: %w", offset, err)
+			return fmt.Errorf("decode span at offset %d: %w", offset, err)
 		}
 
-		spans = append(spans, ScannedSpan{Offset: offset, Span: span})
+		if !fn(offset, span) {
+			return nil
+		}
 		offset += uint64(recordFramingSize) + uint64(length)
 	}
-	return spans, nil
 }
 
 // readHeader parses and validates the fixed-size segment header at the

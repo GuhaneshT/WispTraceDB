@@ -13,7 +13,7 @@ each phase.
 - [x] Confirm `BenchmarkGetSpanWithCompaction` is valid (unique keys) — 4.5x B/op, same allocs; direct evidence for Phase 1 bloom-decode-on-open
 - [x] Re-run `BenchmarkRangeQueryWithCompaction` and `TestCompactionDiagnostic` after the key-collision fix; record valid post-compaction scan numbers — `docs/benchmarks/compaction-20261003.txt` Run 2 (RangeQuery 12.59 ms / 3.04 MB / 70,170 allocs; GetSpan 296 µs / 65.7 KB / 36 allocs)
 - [x] Attribute the valid compacted RangeQuery latency — a 1000-ts window sits inside a 5000-span merged segment, so ScanAll decodes 5000 records and the staleness check issues 5000 index.GetSpan calls before the cheap in-memory time filter. pprof not needed: the order + counts explain it.
-- [x] Reorder RangeQuery to run `filter.matches` BEFORE the per-candidate `index.GetSpan` staleness lookup (correctness-neutral; cuts ~5000 Pebble point reads to ~101 per query at this shape) — `cmd/cmd.go:1361-1371`
+- [x] Reorder RangeQuery to run `filter.matches` BEFORE the per-candidate `index.GetSpan` staleness lookup (correctness-neutral; cuts ~5000 Pebble point reads to ~101 per query at this shape) — `cmd/cmd.go:1412-1418`
 
 ## Phase 1: Point-lookup read path (Priority #1) — Reduce GetSpan overhead
 - [x] segment: Add `OpenReaderLight(path string)` that reads the header only (no bloom decode). `Blooms` stays nil. — `segment/reader.go`
@@ -30,9 +30,9 @@ each phase.
 - [x] Integrate GetSpan, GetTrace, `spanAlreadyIndexed` (recovery) via `acquireSegment`. **RangeQuery deliberately NOT cached**: it needs bloom-section reads and `ScanAll` seeks that are unsafe on a shared reader — recorded here as a won't-do, not an omission.
 - [x] Lifecycle/compaction: compactor takes a `Purger` (`WithPurger`) and calls `Purge(ids)` *before* unlink — closes handles so `os.Remove` succeeds on Windows (probe: `segment/delete_probe_test.go`); purge failure aborts the unlink → orphan file, reported by `CheckConsistency`, never corruption. Both `Close` paths close the cache; `crashClose` test helper closes it too (a real crash closes handles via the OS).
 - [x] Tests pass; fault injection unaffected — full suite green 8 Oct 2026 (`segment/cache_test.go` 10 tests, `cmd/cache_test.go` purge-wiring + disabled-path, fault injection green).
-- [ ] Benchmark GetSpan/GetTrace (+ SpanAlreadyIndexed) vs post-P1 baseline, with/without `WISPTRACE_BENCH_NO_CACHE=1` A/B escape — pending run.
+- [~] Benchmark GetSpan/GetTrace (+ SpanAlreadyIndexed) vs post-P1 baseline, with/without `WISPTRACE_BENCH_NO_CACHE=1` A/B escape — recorded 15 Oct 2026 (`docs/benchmarks/post-cache-20261015.txt`): GetSpan 1,581 → **386 B/op, 22 → 14 allocs**; GetTrace 6,818 → **5,711 B/op, 135 → 128**; spanAlreadyIndexed 1,615 → **365 B/op, 21 → 13**. **A/B invalid**: the `WISPTRACE_BENCH_NO_CACHE=1` arm produced byte-identical numbers, so the env var never reached the test binary and the no-cache control is still missing. Re-run in one shell: `cmd /c "set WISPTRACE_BENCH_NO_CACHE=1 && go test ..."`.
 
-## Phase 3: WAL Group Commit (Priority #3) — Fix parallel insert scaling (0.956x)
+## Phase 3: WAL Group Commit (Priority #3) — Fix parallel insert scaling (does not scale; ~0.74x)
 - [ ] Design: batch appends with a single fsync. Pending batch (records + waiters/channels) + flusher (timer + batch size). Preserve synchronous ack semantics (InsertSpan returns after durable).
 - [ ] wal: extend WAL struct with batch state, mutex, optional background flusher goroutine, per-waiter done channels.
 - [ ] `wal.AppendRecord`: enqueue into current batch, wait for commit (or write+sync immediately if batching disabled). External API semantics unchanged.
@@ -50,7 +50,7 @@ each phase.
 - [ ] Benchmark RangeQuery vs post-P2/P3 baseline; track allocs/op and B/op.
 
 ## Phase 5: Compaction/staleness cost analysis (Priority #5) — Measure unmeasured
-- [ ] Run `BenchmarkRangeQueryWithCompaction` with `-benchmem`; compare to `BenchmarkRangeQuery`.
+- [x] Run `BenchmarkRangeQueryWithCompaction` with `-benchmem`; compared to post-reorder — **2,929,206 B/op, 65,272 allocs** (`post-cache-20261015.txt`), down from 3,043,562 B / 70,170 allocs (`compaction-20261003.txt`). `BenchmarkRangeQuery` (uncompacted) did not finish within the suite's default 10m timeout — run separately with `-timeout`.
 - [ ] Instrument/record candidate count vs returned count (optional temporary counters).
 - [ ] Evaluate bloom effectiveness vs setup cost at current segment sizes.
 - [ ] Decide whether a snapshot iterator over the index (replacing N point `GetSpan` lookups in the staleness check) is worth it while preserving correctness. Correctness > perf.
@@ -67,7 +67,7 @@ each phase.
 - [x] `go vet ./...` (clean, 8 Oct 2026)
 - [x] `go test ./... -v` (green, 8 Oct 2026 — includes Phase 2 cache tests)
 - [x] `go test ./tests -run FaultInjection -v` (durability guard — 6/6 green, 6 Oct 2026; `-short` re-run green 8 Oct 2026; critical for P3)
-- [ ] `go test -bench . -benchmem ./cmd` (compare against baseline)
+- [~] `go test -bench . -benchmem ./cmd` (compare against baseline) — run 15 Oct 2026 (`post-cache-20261015.txt`); `BenchmarkRangeQuery` exceeded the default 10m timeout, so the full suite needs `-timeout 30m` or per-benchmark runs.
 
 ## Notes
 - Columnar segments deferred (not the bottleneck). Setup overhead (opens/bloom decode) dominates measured costs.

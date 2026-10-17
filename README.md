@@ -251,7 +251,7 @@ Compaction and retention expiry run automatically on background tickers; there i
 - **Rollup dimensions are model-only** — root-attributed rollups are designed but not implemented.
 - **Unaligned aggregation windows return nothing** — `QueryAggregations` on a window that is not bucket-aligned silently drops boundary buckets; the columnar-scan fallback is not built.
 - **Columnar segments not implemented** — segments are row-oriented; per-column encoding was deferred.
-- **`QueryWithCursor` is not a stable snapshot** — it re-runs the full `RangeQuery` per page and its numeric-offset cursor can skip or duplicate spans under concurrent flush/compaction.
+- **`QueryWithCursor` is not a stable snapshot** — it re-runs the full `RangeQuery` per page and uses a numeric-offset cursor; concurrent flush/compaction can skip or duplicate spans across pages.
 - **`CheckConsistency` cannot automatically detect a lost index write** — deleted-after-write spans are structurally indistinguishable from a lost index entry, so that check is a warning, not an error.
 - **A span counted in a rollup then deleted later keeps its contribution** until the window expires.
 
@@ -259,11 +259,11 @@ Compaction and retention expiry run automatically on background tickers; there i
 
 Benchmarks are recorded in `docs/benchmarks/` and `benchmark.txt`; root-cause analysis is in `pers.txt` §5. The numbers are laptop-and-Windows-bound (i7-1250U, 12 threads); **the ratios are the findings, not the absolute numbers.**
 
-- **Point lookup**: ~140 µs (well below the 50 ms target). The light read path cut `GetSpan` from 14,547 B / 35 allocs to **1,581 B / 22 allocs** per lookup; `GetTrace` and the recovery dedupe check came down with it.
-- **Parallel insert scales at 0.956x** — fsync-per-append under a mutex. WAL group commit is the planned fix.
-- **`RangeQuery` costs ~132 allocs per returned span** — per-query segment open + bloom decode exceeds the scan cost. It now also does one index lookup per surviving candidate (correctness-required staleness check).
-- **Compaction is unmeasured** — the staleness check's per-scanned-span index lookup has no benchmark number.
-- See [docs/benchmarks/](docs/benchmarks/) and [post-1-unconfirmed-is-not-corrupt.md](docs/blog/post-1-unconfirmed-is-not-corrupt.md) for details and caveats.
+- **Point lookup**: ~140 µs (well below the 50 ms target). The light read path plus the segment reader cache cut `GetSpan` from 14,547 B / 35 allocs to **386 B / 14 allocs** per lookup; `GetTrace` (5,711 B / 128) and the recovery dedupe check (365 B / 13) came down with it.
+- **Parallel insert does not scale** — median **~0.74x** sequential, fsync-per-append under a mutex. WAL group commit is the planned fix.
+- **`RangeQuery` on merged segments costs ~2.93 MB and ~65k allocs per query** for a window returning ~101 spans — `ScanAll` materialises every record in the crossed segment(s) before filtering. The per-candidate staleness index lookup is reordered to run after the cheap filter; an iterator-based scan is the next fix.
+- **`RangeQuery` (uncompacted) did not finish inside the benchmark suite's default 10m timeout** — run it separately with `-timeout`.
+- See [docs/benchmarks/post-cache-20261015.txt](docs/benchmarks/post-cache-20261015.txt) and [post-1-unconfirmed-is-not-corrupt.md](docs/blog/post-1-unconfirmed-is-not-corrupt.md) for details and caveats.
 
 ---
 
@@ -311,8 +311,10 @@ go test ./wal -run TestWALTombstoneRoundTripsAsAuthoritativeDelete -v
 # Run the fault-injection harness (kill -9 durability test)
 go test ./tests -run FaultInjection -v
 
-# Run the benchmarks (see docs/benchmarks/ for the last recorded runs)
-go test ./cmd -run '^$' -bench . -benchmem
+# Run the benchmarks (see docs/benchmarks/ for the last recorded runs).
+# Use -timeout: the full suite exceeds go test's default 10m because every
+# preload insert fsyncs. Run RangeQuery on its own if needed.
+go test ./cmd -run '^$' -bench . -benchmem -timeout 30m
 
 # Check for issues
 go vet ./...

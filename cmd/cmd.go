@@ -1390,36 +1390,39 @@ func (w *WispTrace) RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error) {
 			continue
 		}
 
-		spans, err := reader.ScanAll()
-		closeErr := reader.Close()
-		if err != nil {
-			return nil, fmt.Errorf("scan segment %d: %w", id, err)
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close segment %d reader: %w", id, closeErr)
-		}
-
-		for _, s := range spans {
+		// Stream the segment rather than materialising every record. Most
+		// records in a crossed segment fail the cheap in-memory filter, so
+		// building a []ScannedSpan for all of them only to drop them is pure
+		// waste (see segment.Reader.ScanAllFunc).
+		scanErr := reader.ScanAllFunc(func(offset uint64, s wal.SpanPayload) bool {
 			// Defence in depth: a tombstone is no longer written to a segment
 			// at all, so this can only fire on a segment predating that change.
-			if s.Span.Deleted {
-				continue
+			if s.Deleted {
+				return true
 			}
-			key := segment.CompositeKey(s.Span.TraceID, s.Span.SpanID)
+			key := segment.CompositeKey(s.TraceID, s.SpanID)
 			if _, pending := buffered[key]; pending {
-				continue
+				return true
 			}
-			if !filter.matches(s.Span) {
-				continue
+			if !filter.matches(s) {
+				return true
 			}
 			// Staleness check — see the doc comment. Run after the cheap
 			// in-memory filter to avoid an index lookup for every scanned
 			// record when only a small time window matches.
 			loc, err := w.index.GetSpan([]byte(key))
-			if err != nil || loc.SegmentID != id || loc.Offset != s.Offset {
-				continue
+			if err != nil || loc.SegmentID != id || loc.Offset != offset {
+				return true
 			}
-			results = append(results, s.Span)
+			results = append(results, s)
+			return true
+		})
+		closeErr := reader.Close()
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan segment %d: %w", id, scanErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close segment %d reader: %w", id, closeErr)
 		}
 	}
 
@@ -1460,6 +1463,11 @@ func (w *WispTrace) ListTraces(filter RangeFilter, limit int) ([]string, error) 
 
 // QueryWithCursor returns a paginated slice of matching spans starting from cursor, up to pageSize.
 // It returns the slice of spans and an opaque nextCursor string. An empty nextCursor means no more results.
+//
+// IMPORTANT: This implementation re-runs the full RangeQuery for each page and uses a numeric
+// offset as the cursor. The cursor is not a stable snapshot: concurrent flushes, compactions, or
+// inserts can change the underlying result set, so clients may skip or see spans duplicated across
+// pages. Treat it as "best-effort pagination" rather than a strongly consistent cursor.
 func (w *WispTrace) QueryWithCursor(filter RangeFilter, pageSize int, cursor string) ([]wal.SpanPayload, string, error) {
 	spans, err := w.RangeQuery(filter)
 	if err != nil {
