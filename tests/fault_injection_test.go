@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GuhaneshT/WispTraceDB/cmd"
-	"github.com/GuhaneshT/WispTraceDB/segment"
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/engine"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 // Fault-injection harness (PAD1 §3 / PDD1 §7 — "the test that matters").
@@ -79,7 +79,7 @@ func TestFaultWorker(t *testing.T) {
 		t.Fatalf("fault worker: bad WISPTRACE_FAULT_MAX=%q", os.Getenv(faultMaxEnv))
 	}
 
-	wt, err := cmd.CreateWispTraceWithConfig(faultTestConfig(dir))
+	wt, err := engine.CreateWispTraceWithConfig(faultTestConfig(dir))
 	if err != nil {
 		t.Fatalf("create engine: %v", err)
 	}
@@ -129,8 +129,8 @@ func TestFaultWorker(t *testing.T) {
 // faultTestConfig pins a workload-shaped engine config shared by worker and
 // driver. Timestamps are wall-clock based (never epoch-scale), and retention
 // is effectively disabled so expiry can never prune data mid-test.
-func faultTestConfig(dir string) cmd.WispTraceConfig {
-	cfg := cmd.DefaultWispTraceConfig()
+func faultTestConfig(dir string) engine.WispTraceConfig {
+	cfg := engine.DefaultWispTraceConfig()
 	cfg.WALPath = filepath.Join(dir, "wal.log")
 	cfg.PebblePath = filepath.Join(dir, "lsm")
 	cfg.SegmentDir = filepath.Join(dir, "segments")
@@ -302,7 +302,7 @@ func runFaultCycleExpecting(t *testing.T, killAfter time.Duration, max int, requ
 	verifyAfterCrash(t, cfg, readOracle(oraclePath), max, postcrash, requireFullTail)
 }
 
-func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, max int, postcrash string, requireFullTail bool) {
+func verifyAfterCrash(t *testing.T, cfg engine.WispTraceConfig, oracle []string, max int, postcrash string, requireFullTail bool) {
 	t.Helper()
 	acked := ackSet(oracle)
 	if len(acked) == 0 {
@@ -317,12 +317,12 @@ func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, ma
 
 	// The killed process releases its handles asynchronously on Windows;
 	// brief retry lets the reopen compete with handle teardown.
-	var wt *cmd.WispTrace
+	var wt *engine.WispTrace
 	var err error
 	reopenAttempt := 0
 	for i := 0; i < 30; i++ {
 		reopenAttempt = i + 1
-		wt, err = cmd.CreateWispTraceWithConfig(cfg)
+		wt, err = engine.CreateWispTraceWithConfig(cfg)
 		if err == nil {
 			t.Logf("reopen succeeded on attempt %d", reopenAttempt)
 			break
@@ -377,7 +377,7 @@ func verifyAfterCrash(t *testing.T, cfg cmd.WispTraceConfig, oracle []string, ma
 	// 2. Exactly-once visibility and no phantoms. Collected rather than
 	// asserted on first contact, so the verdict below reports every count on
 	// a passing run instead of reporting nothing.
-	all, err := wt.RangeQuery(cmd.RangeFilter{StartTS: 0, EndTS: 1<<63 - 1})
+	all, err := wt.RangeQuery(engine.RangeFilter{StartTS: 0, EndTS: 1<<63 - 1})
 	if err != nil {
 		t.Fatalf("RangeQuery() = %v", err)
 	}
@@ -527,7 +527,7 @@ func diskCopy(t *testing.T, src, dst string) {
 // callers can assert coverage rather than eyeball a log line: the no-flush case
 // checks that every acked record is physically present in this tail before
 // recovery gets the chance to rebuild it.
-func dumpWALSnapshot(t *testing.T, cfg cmd.WispTraceConfig) (int, map[int]bool) {
+func dumpWALSnapshot(t *testing.T, cfg engine.WispTraceConfig) (int, map[int]bool) {
 	t.Helper()
 	found := make(map[int]bool)
 	maxSeg := cfg.WALMaxSegmentSize
@@ -566,7 +566,7 @@ func dumpWALSnapshot(t *testing.T, cfg cmd.WispTraceConfig) (int, map[int]bool) 
 // disk — including orphan files the manifest no longer references — so a lost
 // acked span can be traced to one of: never durable (WAL), dropped by
 // recovery, or present-but-misindexed.
-func dumpDiskState(t *testing.T, cfg cmd.WispTraceConfig) {
+func dumpDiskState(t *testing.T, cfg engine.WispTraceConfig) {
 	t.Helper()
 	for _, p := range []string{cfg.ManifestPath, cfg.CheckpointPath} {
 		if data, err := os.ReadFile(p); err == nil {
@@ -624,7 +624,7 @@ func TestFaultInjectionInsertFlushDeleteCrash(t *testing.T) {
 	cfg := faultTestConfig(dbDir)
 
 	// Step 1: Open engine, insert span, and flush to segment + index.
-	wt, err := cmd.CreateWispTraceWithConfig(cfg)
+	wt, err := engine.CreateWispTraceWithConfig(cfg)
 	if err != nil {
 		t.Fatalf("create engine: %v", err)
 	}
@@ -661,7 +661,7 @@ func TestFaultInjectionInsertFlushDeleteCrash(t *testing.T) {
 	}
 
 	// Step 4: Reopen engine, triggering crash recovery.
-	wt2, err := cmd.CreateWispTraceWithConfig(cfg)
+	wt2, err := engine.CreateWispTraceWithConfig(cfg)
 	if err != nil {
 		t.Fatalf("reopen after crash: %v", err)
 	}

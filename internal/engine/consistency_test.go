@@ -1,4 +1,4 @@
-package cmd
+package engine
 
 import (
 	"fmt"
@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/GuhaneshT/WispTraceDB/pebble"
-	"github.com/GuhaneshT/WispTraceDB/segment"
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/pebble"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 func insertAndFlush(t *testing.T, wt *WispTrace, spans ...wal.SpanPayload) {

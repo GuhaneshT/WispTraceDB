@@ -1,4 +1,4 @@
-package cmd
+package engine
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/GuhaneshT/WispTraceDB/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
 )
 
 // ConsistencyReport is the result of a CheckConsistency run. Errors are

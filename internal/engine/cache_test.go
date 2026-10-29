@@ -1,12 +1,12 @@
-package cmd
+package engine
 
 import (
 	"os"
 	"testing"
 	"time"
 
-	"github.com/GuhaneshT/WispTraceDB/segment"
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 // The segment reader cache hands its handles to the compactor as a Purger, and

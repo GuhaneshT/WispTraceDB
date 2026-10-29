@@ -1,4 +1,4 @@
-package cmd
+package engine
 
 import (
 	"bytes"
@@ -12,12 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/GuhaneshT/WispTraceDB/bloom"
-	"github.com/GuhaneshT/WispTraceDB/compactor"
-	"github.com/GuhaneshT/WispTraceDB/pebble"
-	"github.com/GuhaneshT/WispTraceDB/rollup"
-	"github.com/GuhaneshT/WispTraceDB/segment"
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/bloom"
+	"github.com/GuhaneshT/WispTraceDB/internal/compactor"
+	"github.com/GuhaneshT/WispTraceDB/internal/pebble"
+	"github.com/GuhaneshT/WispTraceDB/internal/rollup"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 const (

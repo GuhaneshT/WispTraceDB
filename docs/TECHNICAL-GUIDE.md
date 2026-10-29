@@ -138,7 +138,7 @@ The mapping keeps `Cost` as a float in the wire form but rollups convert to fixe
 
 ## 5. Pillar 1 — Ingest
 
-`WispTrace.InsertSpan(span)` — `cmd/cmd.go:529`. Three steps:
+`WispTrace.InsertSpan(span)` — `internal/engine/engine.go:529`. Three steps:
 
 1. **`w.wal.AppendRecord(...)`** — acquires the WAL mutex, rotates if the active
    segment would overflow, appends `version(1) | crc32(4) | length(4) | payload`,
@@ -159,7 +159,7 @@ Nothing else is synchronous. Everything downstream is derived state.
 > production pattern.
 
 `ingestLoop` then calls `processSpan` for each span. `processSpan`
-(`cmd/cmd.go:618`) does two things, in this order:
+(`internal/engine/engine.go:618`) does two things, in this order:
 
 1. **Feeds the rollups** — `w.rollups.Add(ts, model, ScaleCost(cost), tokensIn,
    tokensOut, latency)` — **only when the span is not a tombstone.** This is the
@@ -174,7 +174,7 @@ Nothing else is synchronous. Everything downstream is derived state.
 
 ### The WAL
 
-`wal/wal.go`. Segmented, rotating at 4 MiB (`DefaultMaxSegmentSize`).
+`internal/wal/wal.go`. Segmented, rotating at 4 MiB (`DefaultMaxSegmentSize`).
 
 - **Record framing:** `version(1) | crc32(4) | length(4) | payload` = 9-byte header.
   All little-endian.
@@ -207,7 +207,7 @@ the pool gives each its own buffer without a second lock.
 Two triggers: the 1-second `segmentFlushLoop` ticker flushing traces idle longer than
 `SessionTimeout` (default 5 s), or the inline threshold flush from `processSpan`.
 
-Both converge on `writeSegmentBatch(spans []pendingSpan)` — `cmd/cmd.go:711`. **This
+Both converge on `writeSegmentBatch(spans []pendingSpan)` — `internal/engine/engine.go:711`. **This
 is the most important function in the system.** Ordering here is the whole product.
 
 Under `flushMu`:
@@ -262,10 +262,10 @@ harness). Three ordinary situations break the prediction:
 - a tombstone-only batch, which advances the bound without writing a segment.
 
 The current design stops predicting and starts **counting**. `InsertSpan` calls
-`appendTracked` (`cmd/cmd.go:572`), which holds `walPendingMu` across the WAL append
+`appendTracked` (`internal/engine/engine.go:572`), which holds `walPendingMu` across the WAL append
 *and* the registration, so no reclaim can run in the window between the fsync and
 the count. `walPending[segID]` is the number of acknowledged-but-not-yet-durable
-records in each WAL segment. `releaseWALPending` (`cmd/cmd.go:878`) decrements the
+records in each WAL segment. `releaseWALPending` (`internal/engine/engine.go:878`) decrements the
 counts for the batch just committed, then reclaims everything strictly below the
 lowest still-pending segment (or below the active segment when nothing is pending):
 
@@ -296,7 +296,7 @@ is boring) rather than over-reclaiming (data loss, silent until the next crash).
 
 ## 7. The segment format
 
-`segment/writer.go`. **Row-oriented, not columnar.** PAD1 §3 specifies per-column
+`internal/segment/writer.go`. **Row-oriented, not columnar.** PAD1 §3 specifies per-column
 encoding (delta-of-delta timestamps, dictionary+RLE strings, XOR numerics, zstd);
 none of it is implemented, deliberately deferred. Do not describe this format as
 columnar.
@@ -358,7 +358,7 @@ false negatives are not. A segment is never wrongly *excluded*; it can only be w
 
 ## 8. Pillar 3a — Compaction
 
-`compactor/compactor.go`. `maybeCompactLocked` (`cmd/cmd.go:1009`) fires when the
+`internal/compactor/compactor.go`. `maybeCompactLocked` (`internal/engine/engine.go:1009`) fires when the
 live segment count exceeds `CompactionSegmentThreshold` (default 10), and merges the
 **oldest half** of the live set into one new segment.
 
@@ -413,7 +413,7 @@ because unlinking happens later. So reads remain correct throughout.
 ### `Expire`
 
 Same shape, no merge. `maybeExpireLocked` drops any segment whose header
-`MaxTimestamp` is past the retention cutoff (`cmd/cmd.go:1042`), using the zone map
+`MaxTimestamp` is past the retention cutoff (`internal/engine/engine.go:1042`), using the zone map
 so the decision costs one header read, then reuses the identical staleness +
 index-delete + manifest-swap + unlink path. The index entries are deleted *before*
 the files are unlinked, which is the only ordering that cannot dangle.
@@ -461,7 +461,7 @@ bucket each time.
 ### The unaligned-window gap
 
 `Store.GetBucketInRange` filters `WindowStart >= start && WindowStart < end`
-(`rollup/rollup.go:109`). For a query window that is not itself window-aligned, the
+(`internal/rollup/rollup.go:109`). For a query window that is not itself window-aligned, the
 boundary buckets fail the comparison and are **silently dropped**. A query for
 `[10:00:30, 10:02:30)` returns nothing at all, because the 10:00 bucket starts before
 the range. The columnar-scan fallback that would fix this is designed and not built.
@@ -548,7 +548,7 @@ pruning narrow the candidate set; they say nothing about liveness.
 
 ## 11. Recovery
 
-`recover()` — `cmd/cmd.go:369`. Runs during `CreateWispTraceWithConfig`, before the
+`recover()` — `internal/engine/engine.go:369`. Runs during `CreateWispTraceWithConfig`, before the
 background loops start.
 
 ### Two-phase drain
@@ -589,7 +589,7 @@ compactor's index batch and its manifest swap. Rebuilding from the index means
 recovery cannot resurrect superseded segments.
 
 It also *fails loudly* if the index references a segment file that does not exist
-(`cmd/cmd.go:493`) — that is real data loss, not a reconciliation problem.
+(`internal/engine/engine.go:493`) — that is real data loss, not a reconciliation problem.
 
 ---
 
@@ -621,7 +621,7 @@ Checks, in both directions:
 
 ## 13. Configuration
 
-`DefaultWispTraceConfig()` — `cmd/cmd.go:150`. Every zero value is replaced by its
+`DefaultWispTraceConfig()` — `internal/engine/engine.go:150`. Every zero value is replaced by its
 default, so partial config structs are safe.
 
 | Field | Default | Meaning |
@@ -642,7 +642,7 @@ default, so partial config structs are safe.
 
 `MaxCardinalityPerQuery = 10000` is a package constant, not configurable.
 
-`SegmentCacheSize` backs `segment.Cache` (`segment/cache.go`): a bounded, refcounted
+`SegmentCacheSize` backs `segment.Cache` (`internal/segment/cache.go`): a bounded, refcounted
 set of open readers keyed by segment id, used by the exact-offset read paths
 (`GetSpan`, `GetTrace`, recovery's `spanAlreadyIndexed`). Compaction and expiry call
 `Purge(ids)` before unlinking — on Windows `os.Remove` fails while any handle is open
@@ -675,7 +675,7 @@ characteristics. **The ratios are the findings.**
 > code.** `RangeQuery` and `GetTrace` now consult the session buffer and re-verify
 > candidates against the Pebble index (Finding 2b); `GetSpan` does too. The
 > `GetTrace`/`RangeQuery` figures in particular are optimistic, and the cost of the new
-> per-candidate index lookups is unmeasured. Re-run `cmd/benchmark_test.go` before quoting
+> per-candidate index lookups is unmeasured. Re-run `internal/engine/benchmark_test.go` before quoting
 > any of these numbers — they are retained below for the shape of each problem, not as
 > current evidence.
 
@@ -726,7 +726,7 @@ decision that made compaction's partial merge safe makes group commit trivially 
 ### `GetSpan` costs 14 547 B to read a ~200-byte record
 
 `segment.OpenReader` decodes all five bloom filters into a `map[string]*Filter` on
-every open (`segment/reader.go:33`). A point lookup has an exact `(segment_id,
+every open (`internal/segment/reader.go:33`). A point lookup has an exact `(segment_id,
 offset)` and consults none of them.
 
 **The suggested fix in `pers.txt` was an fd LRU cache. That treats the symptom.** The
@@ -863,7 +863,7 @@ the crash test additionally asserts `GetTrace` finds nothing.
 **Severity: high, same root cause.**
 
 `processSpan` called `w.rollups.Add(...)` unconditionally, before anything looked at
-`Deleted`. And `Store.Add` (`rollup/rollup.go:35`) is purely additive — `Count++`,
+`Deleted`. And `Store.Add` (`internal/rollup/rollup.go:35`) is purely additive — `Count++`,
 `SumCost += cost`. There is no decrement path anywhere in the rollup package.
 
 > **Resolution, partial.** `processSpan` now skips `rollups.Add` for tombstones, so a span
@@ -995,7 +995,7 @@ by a caller constructing `wal.SpanPayload{Deleted: true}` and passing it to
 > (a delete is a point-in-time operation, not a lock on the trace id). Pinned by
 > `TestDeleteSpanRemovesSpanFromAllReadPaths`, `TestDeleteTraceRemovesOnlyThatTrace`,
 > `TestDeleteEmptyIdentifiersError`, `TestDeleteNonExistentIsNoop` and
-> `TestDeleteSpanDurableAcrossCrash` (`cmd/tombstone_test.go`).
+> `TestDeleteSpanDurableAcrossCrash` (`internal/engine/tombstone_test.go`).
 
 ### Finding 4 — cardinality cap fires before the caller's `limit` — **FIXED**
 
@@ -1007,19 +1007,19 @@ by a caller constructing `wal.SpanPayload{Deleted: true}` and passing it to
 instead of returning 5 names. Same in `GetDistinctTeams` and `GetDistinctAgents`.
 
 > **Resolution.** A positive `limit` now short-circuits the scan. `cardinalityStop`
-> (in `cmd/cmd.go`) returns the number of distinct values to collect before stopping and
+> (in `internal/engine/engine.go`) returns the number of distinct values to collect before stopping and
 > whether reaching it is an error: a positive `limit` at or below the cap stops at
 > `limit` and is never an error, so the cap can no longer pre-empt it. With no limit
 > (or a limit above the cap) the `MaxCardinalityPerQuery` error is preserved — the
 > documented hard cap for unbounded queries. Fixed in all three `GetDistinct*`
 > functions. Pinned by `TestCardinalityStopHonoursLimitBeforeCap` and
-> `TestGetDistinctModelsPositiveLimitShortCircuits` (`cmd/cmd_test.go`); the latter
+> `TestGetDistinctModelsPositiveLimitShortCircuits` (`internal/engine/engine_test.go`); the latter
 > would need 10 001 distinct inserts to exercise the cap branch end-to-end, so the
 > decision function is pinned directly instead.
 
 ### Finding 5 — `QueryWithCursor` re-scans and can skip or duplicate
 
-`QueryWithCursor` (`cmd/cmd.go:1412`) calls the full `RangeQuery` and then slices by
+`QueryWithCursor` (`internal/engine/engine.go:1412`) calls the full `RangeQuery` and then slices by
 numeric offset. Two consequences:
 
 - **Cost is O(total) per page**, not O(page).
@@ -1033,14 +1033,14 @@ documented as one.
 
 ### Finding 6 — `maybeCompactLocked` burns a segment ID before its recovery guard
 
-`cmd/cmd.go:1022-1028` increments `nextSegmentID` and *then* checks `w.recovering` and
+`internal/engine/engine.go:1022-1028` increments `nextSegmentID` and *then* checks `w.recovering` and
 returns. Harmless — IDs are never reused, so burning one is safe — but the guard is
 in the wrong place.
 
 ### Finding 7 — the recovery guard does not cover the final recovery flush
 
 `w.recovering` is set to `false` before `flushAllSessions()` runs
-(`cmd/cmd.go:394-398`). The comment states that recovery "must not reclaim any WAL
+(`internal/engine/engine.go:394-398`). The comment states that recovery "must not reclaim any WAL
 segment along the way," yet the final flush runs with the guard already down and can
 therefore trigger inline compaction. This is safe in practice — the `releaseWALPending`
 discipline is independent of the `recovering` flag, and compaction during the final
@@ -1092,24 +1092,24 @@ Restating §15 as rules, because the difference is the point:
 ## Appendix — file map
 
 ```
-wal/wal.go              segmented write-ahead log; span payload codec (shared with segments)
-pebble/pebble.go        Pebble wrapper; (segment_id, offset) value codec; batched put/delete/apply
-bloom/bloom.go          FNV double-hash bloom filter, deterministic across processes
-segment/writer.go       segment writer: header, zone map, bloom section, records
-segment/reader.go       segment reader: header, blooms, ReadAt, ScanAll; OpenReaderLight
-segment/cache.go        bounded refcounted reader cache; Purge-before-unlink; Release
-segment/manifest.go     live segment set; tmp+fsync+rename swap
-compactor/compactor.go  merge, expiry, staleness check, index/file co-deletion
-rollup/rollup.go        bucket store, in-memory, locked
-rollup/manager.go       four windows, fixed-point cost scaling
-rollup/writer.go        snapshot writer (rollup_<window>.rdb)
-rollup/reader.go        snapshot reader with magic/version/window-size validation
-cmd/cmd.go              engine wiring: ingest, sessions, flush, compaction, query API
-cmd/checkpoint.go       durable segment watermark
-cmd/consistency.go      index ↔ segment ↔ manifest cross-checks
-cmd/tombstone_test.go   deletion semantics: all three read paths, both flush timings
-cmd/cache_test.go       segment-cache purge wiring + disabled path
-cmd/benchmark_test.go   8 benchmark harnesses (insert seq/parallel, GetSpan,
+internal/wal/wal.go              segmented write-ahead log; span payload codec (shared with segments)
+internal/pebble/pebble.go        Pebble wrapper; (segment_id, offset) value codec; batched put/delete/apply
+internal/bloom/bloom.go          FNV double-hash bloom filter, deterministic across processes
+internal/segment/writer.go       segment writer: header, zone map, bloom section, records
+internal/segment/reader.go       segment reader: header, blooms, ReadAt, ScanAll; OpenReaderLight
+internal/segment/cache.go        bounded refcounted reader cache; Purge-before-unlink; Release
+internal/segment/manifest.go     live segment set; tmp+fsync+rename swap
+internal/compactor/compactor.go  merge, expiry, staleness check, index/file co-deletion
+internal/rollup/rollup.go        bucket store, in-memory, locked
+internal/rollup/manager.go       four windows, fixed-point cost scaling
+internal/rollup/writer.go        snapshot writer (rollup_<window>.rdb)
+internal/rollup/reader.go        snapshot reader with magic/version/window-size validation
+internal/engine/engine.go              engine wiring: ingest, sessions, flush, compaction, query API
+internal/engine/checkpoint.go       durable segment watermark
+internal/engine/consistency.go      index ↔ segment ↔ manifest cross-checks
+internal/engine/tombstone_test.go   deletion semantics: all three read paths, both flush timings
+internal/engine/cache_test.go       segment-cache purge wiring + disabled path
+internal/engine/benchmark_test.go   8 benchmark harnesses (insert seq/parallel, GetSpan,
                         GetSpanWithCompaction, GetTrace, RangeQuery,
                         RangeQueryWithCompaction, SpanAlreadyIndexed)
 tests/wal_test.go       rotation, replay, corruption, tombstones

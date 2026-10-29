@@ -1,11 +1,11 @@
-package cmd
+package engine
 
 import (
 	"fmt"
 	"path/filepath"
 	"testing"
 
-	"github.com/GuhaneshT/WispTraceDB/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
 )
 
 // TestCompactionDiagnostic inspects the post-compaction segment set: live
@@ -17,7 +17,7 @@ import (
 //
 // Run with:
 //
-//	go test -run TestCompactionDiagnostic -v ./cmd
+//	go test -run TestCompactionDiagnostic -v ./internal/engine
 func TestCompactionDiagnostic(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultWispTraceConfig()

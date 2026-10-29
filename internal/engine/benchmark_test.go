@@ -1,4 +1,4 @@
-package cmd
+package engine
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 func benchConfig(b *testing.B) WispTraceConfig {

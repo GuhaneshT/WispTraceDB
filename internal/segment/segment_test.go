@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 func makeSpan(traceID, spanID string, ts int64) wal.SpanPayload {

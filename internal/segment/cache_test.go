@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 // writeCacheFixture writes a one-record segment and returns the record's

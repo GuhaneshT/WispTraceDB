@@ -116,7 +116,7 @@ func (d *DB) PrefixScan(prefix []byte) ([]SpanLocation, error) {
 }
 
 // ScanAll returns every (key -> SpanLocation) currently in the index, keyed
-// by the raw trace_id||span_id composite key. Used by cmd.CheckConsistency to
+// by the raw trace_id||span_id composite key. Used by engine.CheckConsistency to
 // cross-reference the index against segment files. Unlike PrefixScan this
 // iterates the entire key space (no bounds), so it is a diagnostic/startup
 // path, not a query path.

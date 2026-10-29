@@ -10,7 +10,7 @@ import (
 
 // Manifest is the on-disk record of which segment ids currently make up
 // live, queryable state
-// The manifest is derived state, same as cmd.Checkpoint: if it were lost,
+// The manifest is derived state, same as engine.Checkpoint: if it were lost,
 // the safe (if wasteful) fallback is treating every segment file found on
 // disk as live and rebuilding the manifest from that directory listing.
 type Manifest struct {

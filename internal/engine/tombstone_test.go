@@ -1,12 +1,12 @@
-package cmd
+package engine
 
 import (
 	"errors"
 	"testing"
 
-	"github.com/GuhaneshT/WispTraceDB/pebble"
-	"github.com/GuhaneshT/WispTraceDB/segment"
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/pebble"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 // assertNotReadable checks that one deleted span is absent from every read path:

@@ -27,9 +27,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/GuhaneshT/WispTraceDB/pebble"
-	"github.com/GuhaneshT/WispTraceDB/segment"
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/pebble"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 // Purger is the pre-unlink handle handoff: compaction and expiry call Purge

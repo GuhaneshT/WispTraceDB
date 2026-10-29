@@ -54,6 +54,8 @@ go build ./...
 
 ---
 
+> **v1 in progress.** The engine packages moved under `internal/` (not importable from other modules) as step 1 of [docs/V1-API-DESIGN.md](docs/V1-API-DESIGN.md). The public `wisptrace` package lands in step 2; until then the examples below, which use `cmd.*`, are stale and will be replaced.
+
 ## Quick Start
 
 ### Embedding WispTraceDB in Your Go Application
@@ -306,7 +308,7 @@ go build ./...
 go test ./... -v
 
 # Run a specific test
-go test ./wal -run TestWALTombstoneRoundTripsAsAuthoritativeDelete -v
+go test ./internal/wal -run TestWALTombstoneRoundTripsAsAuthoritativeDelete -v
 
 # Run the fault-injection harness (kill -9 durability test)
 go test ./tests -run FaultInjection -v
@@ -314,7 +316,7 @@ go test ./tests -run FaultInjection -v
 # Run the benchmarks (see docs/benchmarks/ for the last recorded runs).
 # Use -timeout: the full suite exceeds go test's default 10m because every
 # preload insert fsyncs. Run RangeQuery on its own if needed.
-go test ./cmd -run '^$' -bench . -benchmem -timeout 30m
+go test ./internal/engine -run '^$' -bench . -benchmem -timeout 30m
 
 # Check for issues
 go vet ./...
@@ -337,13 +339,13 @@ This test spawns a worker process, force-kills it at various points during inges
 ## Package Layout
 
 ```
-wal/              — Segmented write-ahead log, span encoding/decoding
-pebble/           — LSM index (Pebble wrapper), span location storage
-bloom/            — Fixed-size bloom filters for pruning
-segment/          — Segment writer/reader, manifest, reader cache, immutable storage
-compactor/        — Segment merge, retention expiry, staleness check
-rollup/           — Continuous aggregation windows (1m/5m/1h/1d)
-cmd/              — WispTrace engine: ingestion, queries, checkpoint, consistency, API
+internal/wal/              — Segmented write-ahead log, span encoding/decoding
+internal/pebble/           — LSM index (Pebble wrapper), span location storage
+internal/bloom/            — Fixed-size bloom filters for pruning
+internal/segment/          — Segment writer/reader, manifest, reader cache, immutable storage
+internal/compactor/        — Segment merge, retention expiry, staleness check
+internal/rollup/           — Continuous aggregation windows (1m/5m/1h/1d)
+internal/engine/ — WispTrace engine: ingestion, queries, checkpoint, consistency, API
 tests/            — Fault injection and WAL tests
 docs/             — Architecture, design, technical guides, benchmarks
 ```

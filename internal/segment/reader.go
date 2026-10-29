@@ -8,8 +8,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/GuhaneshT/WispTraceDB/bloom"
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/bloom"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 type Reader struct {

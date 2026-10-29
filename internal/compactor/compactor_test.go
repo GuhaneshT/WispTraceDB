@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/GuhaneshT/WispTraceDB/pebble"
-	"github.com/GuhaneshT/WispTraceDB/segment"
-	"github.com/GuhaneshT/WispTraceDB/wal"
+	"github.com/GuhaneshT/WispTraceDB/internal/pebble"
+	"github.com/GuhaneshT/WispTraceDB/internal/segment"
+	"github.com/GuhaneshT/WispTraceDB/internal/wal"
 )
 
 func testSpan(traceID, spanID string, ts int64, deleted bool) wal.SpanPayload {
@@ -29,7 +29,7 @@ func testSpan(traceID, spanID string, ts int64, deleted bool) wal.SpanPayload {
 
 // setup writes segments (one per spans slice) via the real segment.Writer,
 // indexes every span into a fresh Pebble instance and manifest (mirroring
-// what cmd.WispTrace's flushSegmentLocked does), and returns everything a
+// what engine.WispTrace's flushSegmentLocked does), and returns everything a
 // Compactor needs plus the ids of the segments it wrote.
 func setup(t *testing.T, spansPerSegment [][]wal.SpanPayload) (dir string, idx *pebble.DB, manifest *segment.Manifest, segmentIDs []uint64) {
 	t.Helper()
