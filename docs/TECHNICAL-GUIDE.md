@@ -115,6 +115,25 @@ The same encoder (`wal.EncodeSpanPayload` / `DecodeSpanPayload`) is used for bot
 WAL records and segment records. The segment format reuses the WAL payload verbatim
 rather than defining a parallel encoding.
 
+### 4a. OTLP mapping (planned)
+
+OTLP (OpenTelemetry Protocol) trace spans map cleanly to `wal.SpanPayload` because
+both represent a single operation. A future `otlp` package will translate
+`tracepb.Span` into `SpanPayload` without changing the engine's canonical model:
+
+| OTLP field | Maps to | Notes |
+|---|---|---|
+| `trace_id` (16 bytes) | `TraceID` | Hex/base64 or raw bytes encoded as string in the canonical form used by the engine (16-byte IDs remain valid strings). |
+| `span_id` (8 bytes) | `SpanID` | Same as above. |
+| `parent_span_id` | `ParentSpanID` | Empty slice → `""` (root), matching OTel convention. |
+| `start_time_unix_nano` / `end_time_unix_nano` | `Timestamp`, `LatencyMs` | `Timestamp = start_time_unix_nano` (int64 ns). If both present, `LatencyMs = (end - start)/1_000_000`. If only start is present, latency can come from an attribute. |
+| `status.code` / `status.message` | `Status` | Map `STATUS_CODE_OK/ERROR/UNSET` to short strings (`"ok"`, `"error"`, `"unset"` or similar). |
+| `attributes` (key-value) | `AgentID`, `Model`, `ToolName`, `Team`, `Status` overrides, `TokensIn/Out`, `Cost`, `LatencyMs` | Use well-known attribute keys (e.g. `llm.agent.id`, `llm.model`, `llm.tool.name`, `team`, `llm.usage.input_tokens`, `llm.usage.output_tokens`, `llm.cost.usd`, `duration_ms`). Unknown attributes may be preserved in `Payload`. |
+| `events`, `links`, `resource` | `Payload` | Store a serialized OTLP subset or JSON in `Payload` if needed for fidelity; engine queries don't require them. |
+| `flags`, `trace_state` | `Payload` (optional) | Not required by current query dimensions. |
+
+The mapping keeps `Cost` as a float in the wire form but rollups convert to fixed-point micro-dollars; ingestion should pass the numeric cost (if present). Tombstones remain engine-internal (via `Deleted`). This is additive — `InsertSpan` stays the single ingest entry point.
+
 ---
 
 ## 5. Pillar 1 — Ingest

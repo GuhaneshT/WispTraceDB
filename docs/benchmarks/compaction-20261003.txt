@@ -1,0 +1,77 @@
+# WispTraceDB Phase 0 compaction/staleness benchmark
+# Date: 03-10-2026
+# Host: 12th Gen Intel(R) Core(TM) i7-1250U, Windows, 12 threads
+#
+# Command: go test -run '^$' -bench 'Compaction' -benchmem ./cmd
+# Diagnostic: go test -run TestCompactionDiagnostic -v ./cmd
+
+# ----------------------------------------------------------------------
+# RUN 1 (INVALID) — 87.942s
+# ----------------------------------------------------------------------
+# BenchmarkRangeQueryWithCompaction used trace ids `trace-%d` with i%500 and a
+# fixed span id "span-1", so every write for a composite key superseded the
+# previous. writeSegmentBatch's last-write-wins dedupe left only 500 live keys,
+# only their latest records were indexed, and the diagnostic showed all sample
+# queries returned 0 spans. The numbers below measured a stale-supersede
+# workload, not a range scan. Kept only as a cautionary record.
+#
+BenchmarkRangeQueryWithCompaction-12     632     6487825 ns/op     81312 B/op     217 allocs/op
+BenchmarkGetSpanWithCompaction-12       4676      228261 ns/op     65647 B/op      36 allocs/op
+ok      github.com/GuhaneshT/WispTraceDB/cmd    87.942s
+
+# ----------------------------------------------------------------------
+# RUN 2 (VALID) — after fixing the key collision — 65.895s
+# ----------------------------------------------------------------------
+goos: windows
+goarch: amd64
+pkg: github.com/GuhaneshT/WispTraceDB/cmd
+cpu: 12th Gen Intel(R) Core(TM) i7-1250U
+BenchmarkRangeQueryWithCompaction-12       85     12586269 ns/op   3043562 B/op   70170 allocs/op
+BenchmarkGetSpanWithCompaction-12        3429       295814 ns/op     65684 B/op      36 allocs/op
+PASS
+ok      github.com/GuhaneshT/WispTraceDB/cmd    65.895s
+
+# ----------------------------------------------------------------------
+# Diagnostic (RUN 2 state): 15000 spans, 7 live segments
+# ----------------------------------------------------------------------
+#   seg 11: spans=1000 ts=[100000,109990] bloomSection=6035 bytes
+#   seg 12: spans=5000 ts=[0,49990]       bloomSection=29995 bytes   <- merged
+#   seg 13: spans=1000 ts=[110000,119990] bloomSection=6035 bytes
+#   seg 14: spans=1000 ts=[120000,129990] bloomSection=6035 bytes
+#   seg 15: spans=1000 ts=[130000,139990] bloomSection=6035 bytes
+#   seg 16: spans=1000 ts=[140000,149990] bloomSection=6035 bytes
+#   seg 17: spans=5000 ts=[50000,99990]   bloomSection=29995 bytes   <- merged
+#   total spans across live segments: 15000 (inserted 15000)
+#   queries [0,1000] .. [120000,121000]: returned=101 each
+#
+# The dataset is now correct: all 15000 spans live, query returns ~101 spans.
+
+# ----------------------------------------------------------------------
+# Comparison with the 26-09-2026 baseline (no compaction)
+# ----------------------------------------------------------------------
+#
+#   RangeQuery       (baseline)  : 2,518,068 ns   743,389 B   13,228 allocs
+#   RangeQuery       (compacted) : 12,586,269 ns 3,043,562 B    70,170 allocs
+#     -> 5.0x SLOWER, 4.1x more bytes, 5.3x more allocs
+#
+#   GetSpan          (baseline)  :   140,070 ns    14,547 B       35 allocs
+#   GetSpan          (compacted) :   295,814 ns    65,684 B       36 allocs
+#     -> 2.1x SLOWER, 4.5x more bytes, same allocs
+#
+# Reading:
+#   - GetSpan B/op rose 4.5x with allocs flat. segment.OpenReader decodes the
+#     bloom section on every point lookup (cmd/cmd.go:978 -> reader.go:22);
+#     merged segments carry ~30 KB bloom sections vs ~6 KB for a 1000-span
+#     segment. The bytes track bloom size, not record size. Direct evidence for
+#     Phase 1: the point path must not decode blooms it never consults.
+#   - RangeQuery got 5x slower and 5x more allocs. A 1000-ts window sits inside
+#     one 5000-span merged segment, so ScanAll decodes all 5000 records and the
+#     per-candidate staleness check issues an index.GetSpan for every one of
+#     them BEFORE the cheap in-memory time filter (cmd/cmd.go:1186-1203) runs.
+#     ~70,170 allocs / 5000 scanned ~= 14 allocs per scanned record.
+#     Two follow-ups fall out of this, both correctness-neutral:
+#       (1) run filter.matches BEFORE the staleness index lookup, so only the
+#           ~101 matching records cost a Pebble point read instead of 5000;
+#       (2) iterator-based ScanAll to stop materialising every record.
+#     The staleness check itself must stay (deleted spans exist only in the
+#     index); only its ordering changes.

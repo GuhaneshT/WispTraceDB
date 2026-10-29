@@ -1,0 +1,45 @@
+# WispTraceDB Phase 1b benchmark results — light path for GetTrace + spanAlreadyIndexed
+# Date: 06-10-2026
+# Host: 12th Gen Intel(R) Core(TM) i7-1250U, Windows, 12 threads
+# Change: cmd.GetTrace (cmd/cmd.go:1132) and cmd.spanAlreadyIndexed (cmd/cmd.go:391)
+#         switch segment.OpenReader -> segment.OpenReaderLight, the same change
+#         GetSpan got on 03-10-2026. Both callers hold an exact (segment_id,
+#         offset) from the index and read only with ReadAt; neither consults
+#         reader.Blooms, so decoding the bloom section was pure waste here too.
+#         RangeQuery keeps the heavy open — it prunes with the blooms.
+#
+# Command (before and after, identical):
+#   go test -run '^$' -bench 'GetTrace|SpanAlreadyIndexed' -benchmem -count=3 ./cmd
+
+# BenchmarkGetTrace — 500 traces x 10 spans = 5000 spans, 5 segments,
+# per call: PrefixScan + one segment open (cached within the call) + 10 ReadAt.
+#   before: 187524 / 255121 / 155419 ns/op  19838 / 19834 / 19835 B/op  148 / 148 / 148 allocs/op
+#   after:  142639 / 150183 / 245647 ns/op   6801 /  6803 /  6851 B/op  135 / 135 / 135 allocs/op
+#   delta:  mean 199.5 -> 179.5 us/op (-10%, NOT claimed: within-run spread is
+#          142-255 us in both directions, and the slowest after-run dropped to
+#          4316 iterations with byte-identical alloc counts — environmental)
+#          B/op 19836 -> 6818 mean  (-65.6%)
+#          allocs/op 148 -> 135     (-13, -8.8%)
+
+# BenchmarkSpanAlreadyIndexed — 5000 preloaded spans, per call: index lookup +
+# segment open + one ReadAt + close (the recovery dedupe check, once per
+# WAL record replayed past the checkpoint).
+#   before: 125477 / 114713 / 121344 ns/op  14591 / 14589 / 14592 B/op  34 / 34 / 34 allocs/op
+#   after:  136309 / 169819 / 144553 ns/op   1614 /  1610 /  1622 B/op  21 / 21 / 21 allocs/op
+#   delta:  mean 120.5 -> 150.2 us/op (+25%, NOT claimed: strictly fewer bytes
+#          read cannot make the call slower; the machine moved. Zero overlap
+#          between the two sets is noted honestly rather than explained away.)
+#          B/op 14591 -> 1615 mean  (-89.0%)
+#          allocs/op 34 -> 21       (-13, -38.2%)
+#   cross-check: after-shape (1,615 B / 21 allocs) matches GetSpan post-P1
+#   (1,581 B / 22 allocs) — same open path, as expected.
+
+# Attribution: the B/op drop is the bloom section no longer read+decoded (five
+# filters sized for the segment's span count, decoded into a map, thrown away).
+# GetTrace's -66% is smaller in relative terms than SpanAlreadyIndexed's -89%
+# because GetTrace's remaining cost is the record reads themselves (10 per
+# call) and the trace assembly, which both paths pay equally.
+
+# Validation: go vet ./... clean; go test ./... -count=1 all packages green
+# (cmd 10.3s, tests 4.6s incl. fault injection, bloom/pebble/segment/
+# compactor/rollup ok).

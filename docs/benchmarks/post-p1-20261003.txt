@@ -1,0 +1,42 @@
+# WispTraceDB Phase 1 benchmark results
+# Date: 03-10-2026
+# Host: 12th Gen Intel(R) Core(TM) i7-1250U, Windows, 12 threads
+# Change: segment.OpenReaderLight added; GetSpan uses the light path
+#         (skip bloom decode on point reads)
+
+# Command: go test -run '^$' -bench 'GetSpan' -benchmem ./cmd
+
+goos: windows
+goarch: amd64
+pkg: github.com/GuhaneshT/WispTraceDB/cmd
+cpu: 12th Gen Intel(R) Core(TM) i7-1250U
+BenchmarkGetSpan-12                       6999            199521 ns/op            1581 B/op         22 allocs/op
+BenchmarkGetSpanWithCompaction-12         7677            168685 ns/op            1644 B/op         22 allocs/op
+PASS
+ok      github.com/GuhaneshT/WispTraceDB/cmd    44.767s
+
+# Comparison vs baseline (26-09-2026)
+
+# GetSpan (no compaction):
+#   baseline  (26-09-2026): 140,070 ns/op  14,547 B/op  35 allocs/op
+#   after P1  (03-10-2026): 199,521 ns/op   1,581 B/op  22 allocs/op
+#     delta: +42% ns/op  -89.1% B/op  -37% allocs/op
+#     Note: ns/op variance small; memory win is unambiguous.
+
+# GetSpanWithCompaction (post-compaction, valid):
+#   RUN 2 before P1: 295,814 ns/op  65,684 B/op  36 allocs/op
+#   after P1        : 168,685 ns/op   1,644 B/op  22 allocs/op
+#     delta: -43% ns/op  -97.5% B/op  -39% allocs/op
+#     Cause: merged segments had large bloom sections (~30 KB); decoding them
+#     on every point lookup is pure overhead. With OpenReaderLight, blooms are
+#     never touched.
+
+# Phase 1 change detail:
+# - segment.OpenReaderLight(path) (segment/reader.go): reads header only, leaves
+#   Blooms nil. Callers needing blooms must use OpenReader.
+# - cmd.GetSpan uses OpenReaderLight (cmd/cmd.go:1080).
+# - At the time of these numbers, GetTrace and spanAlreadyIndexed still used
+#   segment.OpenReader; an earlier draft of this file claimed they had been
+#   converted too and was reverted before the numbers were produced.
+#   Both were converted later, each with its own before/after benchmark:
+#   see post-p1b-20261006.txt.

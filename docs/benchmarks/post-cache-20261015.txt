@@ -1,0 +1,10 @@
+
+# After ScanAllFunc (streaming) - 15-10-2026
+# go test -run ^$ -bench BenchmarkRangeQueryWithCompaction -benchmem -timeout 20m ./cmd
+goos: windows
+goarch: amd64
+pkg: github.com/GuhaneshT/WispTraceDB/cmd
+cpu: 12th Gen Intel(R) Core(TM) i7-1250U
+BenchmarkRangeQueryWithCompaction-12                 321           3643905 ns/op1195122 B/op       60270 allocs/op
+PASS
+ok      github.com/GuhaneshT/WispTraceDB/cmd    29.179s

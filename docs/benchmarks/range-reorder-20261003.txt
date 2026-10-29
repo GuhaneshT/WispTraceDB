@@ -1,0 +1,20 @@
+# WispTraceDB RangeQuery filter-before-staleness reorder
+# Date: 03-10-2026
+# Change: In RangeQuery, run filter.matches(s.Span) before the per-candidate
+#         index.GetSpan staleness lookup (correctness-neutral).
+
+# Expected effect (from Run 2 post-compaction diagnostic):
+#   Window matches ~101 spans inside a 5000-span segment; reordering avoids
+#   5000 Pebble point reads per query (only ~101 lookups). Should reduce
+#   allocs/op and ns/op substantially on the compacted RangeQuery.
+#
+# To measure: run
+#   go test -run '^$' -bench 'RangeQuery' -benchmem ./cmd
+#
+# Anticipated comparison (post-P1 baseline for compacted is Run 2 of compaction
+# bench before this reorder):
+#   BenchmarkRangeQueryWithCompaction-12  85  12,586,269 ns/op  3,043,562 B/op  70,170 allocs/op
+#   After reorder: expect allocs ~ (baseline scan alloc profile for ~101 returned)
+#   but dominated by per-candidate index lookups eliminated. Should drop hard.
+#   Also BenchmarkRangeQuery (uncompacted) will see smaller but real improvement
+#   depending on how many candidates pass zone/bloom filters per segment.
