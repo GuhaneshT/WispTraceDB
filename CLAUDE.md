@@ -17,8 +17,9 @@ Pillars 2 and 3 are derived state — fully rebuildable from Pillar 1 (the WAL).
 
 ## v1 release work (in progress — see `docs/V1-API-DESIGN.md`)
 
-- **Step 1 done (unverified):** engine packages moved under `internal/` (`internal/{wal,segment,pebble,bloom,compactor,rollup}`; the old `cmd` package is now `internal/engine`, package `engine`). Imports and doc paths were rewritten mechanically; **no Go toolchain was on the PATH, so build/vet/tests/fault-injection were NOT run after the move.** First thing to do with Go available: `go build ./... && go vet ./... && go test ./...` plus `go test ./tests -run FaultInjection -v`, and `gofmt -l .`.
-- Next: public `wisptrace` facade, then `server/` + `cmd/wisptraced`, then LICENSE/CI/docs. Decisions: visibility option A (durable on return, `Sync`, opt-in `WithReadYourWrites`), probe index to avoid rollup double-count on retry (else document at-least-once).
+- **Step 1 done and verified by the user (2026-10-29):** engine packages moved under `internal/` (`internal/{wal,segment,pebble,bloom,compactor,rollup}`; the old `cmd` package is now `internal/engine`, package `engine`). Build, vet and the full test suite ran green on their machine. Go 1.26.6 lives at `C:\Users\guhanesht\sdk\go\bin` (added to the user PATH); an agent shell here can compile and vet but **cannot execute test binaries** (Windows "Access is denied"), so tests must be run by the user.
+- **Step 2 (facade) written, compiles and vets, tests NOT yet run:** root package `wisptrace` (`doc.go errors.go span.go validate.go options.go db.go query.go wisptrace_test.go`). API: `Open(dir, opts...)`, `Ingest/IngestBatch/Sync/Span/Trace/DeleteSpan/DeleteTrace/Query/Costs/TokensByModel/ErrorRate/Check/Close`; options `WithRetention/WithFlushThreshold/WithSegmentCacheSize/WithReadYourWrites`; errors `ErrNotFound/ErrInvalidSpan/ErrClosed/*ValidationError`. On-disk layout inside the dir: `wal.log`, `segments/`, `index/`, `checkpoint.dat`, `manifest.dat`. Not yet done: Top/Distinct wrappers, dedupe-on-retry for rollups, README rewrite.
+- Next: `server/` + `cmd/wisptraced`, then LICENSE/CI/docs. Decisions: visibility option A (durable on return, `Sync`, opt-in `WithReadYourWrites`), probe index to avoid rollup double-count on retry (else document at-least-once).
 - Path references elsewhere in this file that say `cmd/...` or bare `wal/...` predate the move; the layout/commands sections are updated, historical prose may not be.
 
 ## Build order (PAD1 §12)
@@ -225,6 +226,8 @@ go fmt ./...
 ## Package layout
 
 ```
+(root)           package wisptrace — the public library. Entry point: db.go (`Open`, `DB`);
+                  span.go/validate.go/errors.go/options.go/query.go; doc.go has the guarantees.
 internal/wal/
   wal.go          — segmented write-ahead log, span record encoding/decoding
 

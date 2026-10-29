@@ -43,7 +43,7 @@ costs, err := db.Costs(ctx, wisptrace.ByModel, wisptrace.Last(24*time.Hour))
 - **Errors:** `ErrNotFound`, `ErrInvalidSpan` (wrapping a field-level `ValidationError`),
   `ErrClosed`, `ErrLocked`, `ErrCorrupt` — all usable with `errors.Is`.
 - **Options:** functional options over the existing config knobs. One data directory holds
-  `wal/`, `segments/`, `index/`, `checkpoint.dat`, `manifest.dat`.
+  `wal.log`, `segments/`, `index/`, `checkpoint.dat`, `manifest.dat`.
 - **Context:** honoured on entry and between batch items. The engine cannot abort an fsync
   mid-call; this is documented, not hidden.
 
