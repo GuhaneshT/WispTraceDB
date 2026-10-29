@@ -738,24 +738,23 @@ pruning metadata.
 ### `RangeQuery` on merged segments — **now measured** (`post-cache-20261015.txt`)
 
 `BenchmarkRangeQueryWithCompaction` (15,000 spans, merged segments, a 1000-ts window
-returning ~101 spans) costs **~2.93 MB and ~65,272 allocs per query**. Cost is not per
-returned span — it is per *scanned* record. `ScanAll` (`segment/reader.go`) materialises
-every record in every segment the time range crosses, and the ~65k allocs ÷ ~5,000
+returning ~101 spans) costs **~1.20 MB and ~60,270 allocs per query** after the
+filter-before-staleness reorder and the streaming `ScanAllFunc`
+(`post-cache-20261015.txt`; it was ~3.04 MB / 70,170 allocs in `compaction-20261003.txt`).
+Cost is not per returned span — it is per *scanned* record: the ~60k allocs ÷ ~5,000
 scanned records is the decode cost; the ~101 that match are a rounding error.
 
-The older "≈132 allocs per returned span" figure is superseded. The shape is unchanged
-from the diagnosis below; only the magnitude and the point at which the cost sits have
-been pinned down. Two follow-ups remain:
+The older "≈132 allocs per returned span" figure is superseded. Two follow-ups remain:
 
 - **the index re-verification** is per-*candidate*. The filter-before-staleness reorder
-  is now applied (`cmd.RangeQuery` runs `filter.matches` before `index.GetSpan`), which
-  removed roughly one Pebble point lookup per *scanned* record — the ~4,900-alloc drop
-  from 70,170 to 65,272. The deeper fix, one Pebble snapshot iterator with `SeekGE`
-  per key instead of N independent `Get`s, is still not attempted: new API on the index
-  wrapper.
-- **`ScanAll` materialisation** is now the dominant term. An iterator-based scan that
-  filters as it reads, instead of building a `[]ScannedSpan` of everything, is the next
-  fix and is not done.
+  is applied (`cmd.RangeQuery` runs `filter.matches` before `index.GetSpan`), which
+  removed roughly one Pebble point lookup per *scanned* record. The deeper fix, one
+  Pebble snapshot iterator with `SeekGE` per key instead of N independent `Get`s, is
+  still not attempted: new API on the index wrapper.
+- **record decode** is now the dominant term. `segment.ScanAllFunc` streams records to a
+  callback instead of building a `[]ScannedSpan` of everything (done), but each scanned
+  record is still fully decoded before the filter runs; decoding only the fields the
+  filter needs is not done.
 
 `RangeQuery` (uncompacted) did not complete inside the benchmark suite's default 10m
 timeout — the suite is dominated by fsync-bound preload inserts, so run that benchmark

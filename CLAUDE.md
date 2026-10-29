@@ -108,7 +108,7 @@ Full write-up with reasoning in `docs/TECHNICAL-GUIDE.md` §15.
 - Rollup dimensions are `model` only. PAD1 §6 contemplates a 5-dimension group.
 - No OTLP ingestion, no HTTP server, no `main` package. This is a library + engine, not yet a runnable product.
 - Tombstones store a full span body in the WAL rather than a compact delete record. Known inefficiency, deferred (`docs/checklist.txt`, "v1 Storage").
-- **Benchmarks recorded; the query path is measurably bad, point lookup fixed.** Latest full run: `docs/benchmarks/post-cache-20261015.txt` (15 Oct 2026, same host). `benchmark.txt` has the 26 Sep 2026 origin run and `pers.txt` §5 records root causes verified against source. Two committed SLOs pass with large headroom (point lookup 140 µs vs the 50 ms target). Parallel insert does **not** scale — median ~**0.74x** sequential (was recorded as 0.956x; ranges overlap, so the honest claim is "no scaling, plausibly slight contention"). Root cause unchanged: fsync-per-append under a mutex; fix is group commit, safe here precisely because no cross-writer ordering is promised. The segment reader cache (`segment/cache.go`) plus its pooled `*segment.Release` cut the exact-offset paths again versus the light-open numbers: `GetSpan` **1,581 → 386 B/op, 22 → 14 allocs**; `spanAlreadyIndexed` **1,615 → 365 B/op, 21 → 13 allocs**; `GetTrace` **6,818 → 5,711 B/op, 135 → 128 allocs**. **The cache A/B is unconfirmed**: the intended no-cache run (`WISPTRACE_BENCH_NO_CACHE=1`) produced byte-identical B/op and allocs, so the env var never reached the test binary and the direct-open baseline is still missing. Latency is noise-bound on this laptop and is not claimed in either direction. `RangeQueryWithCompaction` is the remaining hotspot: **~2.93 MB/op, 65,272 allocs** for a window returning ~101 spans, dominated by `ScanAll` materialising every record in the crossed segment(s) (~65k allocs / 5000 scanned records); the filter-before-staleness reorder is applied (it removed the ~4900 per-candidate index lookups), an iterator-based `ScanAll` is the next fix and is not done. `RangeQuery` itself did not complete inside the suite's default 10m test timeout and must be run separately. Published in `docs/blog/post-1-unconfirmed-is-not-corrupt.md`.
+- **Benchmarks recorded; the query path is measurably bad, point lookup fixed.** Latest full run: `docs/benchmarks/post-cache-20261015.txt` (15 Oct 2026, same host). `benchmark.txt` has the 26 Sep 2026 origin run and `pers.txt` §5 records root causes verified against source. Two committed SLOs pass with large headroom (point lookup 140 µs vs the 50 ms target). Parallel insert does **not** scale — median ~**0.74x** sequential (was recorded as 0.956x; ranges overlap, so the honest claim is "no scaling, plausibly slight contention"). Root cause unchanged: fsync-per-append under a mutex; fix is group commit, safe here precisely because no cross-writer ordering is promised. The segment reader cache (`segment/cache.go`) plus its pooled `*segment.Release` cut the exact-offset paths again versus the light-open numbers: `GetSpan` **1,581 → 386 B/op, 22 → 14 allocs**; `spanAlreadyIndexed` **1,615 → 365 B/op, 21 → 13 allocs**; `GetTrace` **6,818 → 5,711 B/op, 135 → 128 allocs**. **The cache A/B is unconfirmed**: the intended no-cache run (`WISPTRACE_BENCH_NO_CACHE=1`) produced byte-identical B/op and allocs, so the env var never reached the test binary and the direct-open baseline is still missing. Latency is noise-bound on this laptop and is not claimed in either direction. `RangeQueryWithCompaction` is the remaining hotspot: **~1.20 MB/op, 60,270 allocs** (down from 3.04 MB / 70,170) for a window returning ~101 spans. The filter-before-staleness reorder (it removed the ~4900 per-candidate index lookups) and the streaming `segment.ScanAllFunc` are both applied; the cost is still per *scanned* record (~60k allocs / 5000 scanned records, record decode), and the per-candidate staleness lookup is still N point `Get`s rather than one snapshot iterator — not done. `RangeQuery` itself did not complete inside the suite's default 10m test timeout and must be run separately. Published in `docs/blog/post-1-unconfirmed-is-not-corrupt.md`.
 
 ## Current state
 
@@ -225,6 +225,7 @@ wal/
 pebble/
   pebble.go       — LSM index (Pebble wrapper), span location storage
   pebble_test.go  — index tests (put/get, prefix scan, delete)
+  OPTIMIZATIONS.md — notes on pooled-buffer / allocation work in the index
 
 bloom/
   bloom.go        — fixed-size bloom filter, deterministic double hashing
@@ -232,18 +233,20 @@ bloom/
 
 segment/
   writer.go       — row-oriented segment writer: header, bloom section, records
-  reader.go       — segment reader: header/bloom access, ReadAt, ScanAll;
+  reader.go       — segment reader: header/bloom access, ReadAt, ScanAll,
+                    streaming ScanAllFunc;
                     OpenReaderLight (header-only, no bloom decode)
   cache.go        — bounded refcounted reader cache; Release lease;
                     Purge-before-unlink for Windows
   manifest.go     — derived segment-set pointer, tmp+fsync+rename swap
-  *_test.go
+  *_test.go       — incl. delete_probe_test.go (Windows unlink-while-open probe)
 
 compactor/
   compactor.go    — segment merge + retention expiry + co-deletion + staleness check
   compactor_test.go
 
 rollup/
+  rollup.go       — per-window Store: buckets, Add, range lookup, Evict
   manager.go      — 1m/5m/1h/1d windows, fixed-point cost scaling
   writer.go       — rollup snapshot writer (rollup_<window>.rdb)
   reader.go       — snapshot reader with magic/version/window-size validation
@@ -257,6 +260,7 @@ cmd/
   tombstone_test.go — deletion semantics across all three read paths and both
                     flush timings (single-window, mixed, later-flush, un-flushed)
   cache_test.go   — segment-cache purge wiring + disabled path
+  compaction_diagnostic_test.go — TestCompactionDiagnostic (caught a benchmark key-collision bug)
   benchmark_test.go — 8 benchmark harnesses (insert seq/parallel, GetSpan,
                     GetSpanWithCompaction, GetTrace, RangeQuery,
                     RangeQueryWithCompaction, SpanAlreadyIndexed; results in
@@ -271,6 +275,9 @@ docs/
   PAD1.md         — frozen v1.3.2 architecture doc (non-negotiable)
   PDD1.md         — frozen v1.3 design doc (non-negotiable)
   checklist.txt   — build/work-split checklist and deferred items
+  OPTIMIZATION-CHECKLIST.md — perf-phase tracker (phases 0-6, validation gates)
+  TECHNICAL-GUIDE.md — as-built deep dive (§15 = deletion bugs and fixes)
+  benchmarks/     — recorded runs (baseline-20260926 ... post-cache-20261015)
   blog/
     post-1-unconfirmed-is-not-corrupt.md — storage/correctness post (lead)
     post-2-cost-is-not-a-metric.md       — domain/rollups post

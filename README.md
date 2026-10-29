@@ -261,7 +261,7 @@ Benchmarks are recorded in `docs/benchmarks/` and `benchmark.txt`; root-cause an
 
 - **Point lookup**: ~140 µs (well below the 50 ms target). The light read path plus the segment reader cache cut `GetSpan` from 14,547 B / 35 allocs to **386 B / 14 allocs** per lookup; `GetTrace` (5,711 B / 128) and the recovery dedupe check (365 B / 13) came down with it.
 - **Parallel insert does not scale** — median **~0.74x** sequential, fsync-per-append under a mutex. WAL group commit is the planned fix.
-- **`RangeQuery` on merged segments costs ~2.93 MB and ~65k allocs per query** for a window returning ~101 spans — `ScanAll` materialises every record in the crossed segment(s) before filtering. The per-candidate staleness index lookup is reordered to run after the cheap filter; an iterator-based scan is the next fix.
+- **`RangeQuery` on merged segments costs ~1.2 MB and ~60k allocs per query** for a window returning ~101 spans (down from ~3.0 MB / 70k). The cost is per *scanned* record, not per returned span. The per-candidate staleness index lookup now runs after the cheap filter and the scan streams via `ScanAllFunc`; replacing the N point lookups with one index snapshot iterator is not done.
 - **`RangeQuery` (uncompacted) did not finish inside the benchmark suite's default 10m timeout** — run it separately with `-timeout`.
 - See [docs/benchmarks/post-cache-20261015.txt](docs/benchmarks/post-cache-20261015.txt) and [post-1-unconfirmed-is-not-corrupt.md](docs/blog/post-1-unconfirmed-is-not-corrupt.md) for details and caveats.
 
