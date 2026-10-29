@@ -59,6 +59,10 @@ func Open(dir string, opts ...Option) (*DB, error) {
 func (db *DB) Close() error {
 	db.closeOnce.Do(func() {
 		db.closed.Store(true)
+		// Let spans already acknowledged but still queued reach the final
+		// flush. Without this they stay in the log and are replayed on the
+		// next Open, which is correct but slower.
+		db.eng.WaitForIngest()
 		db.closeErr = db.eng.Close()
 	})
 	return db.closeErr
@@ -146,6 +150,16 @@ func (db *DB) Sync(ctx context.Context) error {
 	}
 }
 
+// Flush writes every buffered span to a segment now instead of waiting for
+// the size or idle trigger. It is not needed for durability, since spans are
+// durable once acknowledged. It is useful before copying the data directory.
+func (db *DB) Flush(ctx context.Context) error {
+	if err := db.check(ctx); err != nil {
+		return err
+	}
+	return db.eng.Flush()
+}
+
 // Span returns one span, or ErrNotFound.
 func (db *DB) Span(ctx context.Context, traceID, spanID string) (Span, error) {
 	if err := db.check(ctx); err != nil {
@@ -161,7 +175,7 @@ func (db *DB) Span(ctx context.Context, traceID, spanID string) (Span, error) {
 	return fromPayload(p), nil
 }
 
-// Trace returns every live span of a trace, or ErrNotFound.
+// Trace returns every live span of a trace in start-time order, or ErrNotFound.
 func (db *DB) Trace(ctx context.Context, traceID string) ([]Span, error) {
 	if err := db.check(ctx); err != nil {
 		return nil, err
@@ -173,7 +187,9 @@ func (db *DB) Trace(ctx context.Context, traceID string) ([]Span, error) {
 	if !found || len(ps) == 0 {
 		return nil, ErrNotFound
 	}
-	return fromPayloads(ps), nil
+	spans := fromPayloads(ps)
+	sortSpans(spans, false)
+	return spans, nil
 }
 
 // DeleteSpan durably deletes one span. Deleting an absent span is a no-op.

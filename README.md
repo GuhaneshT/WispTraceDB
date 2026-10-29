@@ -1,403 +1,394 @@
 # WispTraceDB
 
-A single-node, embeddable trace store for LLM agent spans. Purpose-built for durability, fast aggregation queries, and seamless embedding into Go services.
+**An embeddable trace store for LLM agents, written in pure Go.**
 
-## What is WispTraceDB?
+Record every model call, tool call and agent step as a span. Get the full trace back by ID,
+filter spans by model, team or status, and answer "what did this cost?" over any time window.
+There is no server to run and nothing else to install: it is a Go package that stores its data
+in a directory next to your application.
 
-WispTraceDB is a specialized database for storing and querying traces from LLM agent systems. It's designed for:
+```go
+db, _ := wisptrace.Open("./traces")
+defer db.Close()
 
-- **Solo builders and small teams** running LLM agents in production
-- **Go services** that want to embed trace storage directly without running a separate database process
-- **Applications** that need crash-safe durability, full trace reconstruction, and aggregation queries over cost/latency/token data
-
-It is **not** a general-purpose database. It accepts a stream of spans (units of work in a trace), makes them durable immediately, and answers three classes of queries: point lookups, range scans, and time-windowed aggregations.
-
----
-
-## Key Features
-
-### 🛡️ Crash-Safe Durability
-Every acknowledged span survives any crash — power loss, OOM kill, or panic. The Write-Ahead Log (WAL) is fsynced before each acknowledgment, and all derived state (segments, index, rollups) is rebuildable by replaying the WAL.
-
-### 📊 Full Trace Reconstruction
-Retrieve any complete trace by ID. Traces are hierarchical (parent-child span relationships are preserved), and reconstruction is fast even for large traces.
-
-### ⚡ Fast Aggregation Queries
-Answer "cost by model" or "token distribution by model" over any time window. Built on continuous rollup windows (1m, 5m, 1h, 1d). Bloom filters and zone maps keep query costs bounded. (Root-attributed "cost of workflows started by Agent X" rollups are designed but not yet implemented.)
-
-### 📦 Embeddable Design
-No external services required — no S3, Kafka, or separate database process. Import the Go package into your application and start using it immediately.
-
-### 🔍 LSM-Based Indexing
-Trace index powered by Pebble (a production-grade LSM tree). Supports fast point lookups and range scans over traces.
-
-### 📝 Immutable Segments & Compaction
-Writes are buffered into row-oriented segments. Compaction merges segments, prunes expired data, and maintains index consistency — all without mutating data in place.
-
----
-
-## Installation
-
-Requires **Go 1.23 or later**.
-
-```bash
-go get github.com/GuhaneshT/WispTraceDB/cmd
+ctx, span := db.StartSpan(ctx, "summarize")
+span.SetModel("gpt-4")
+span.SetTokens(812, 164)
+span.SetCost(0.0213)
+span.End(ctx)
 ```
 
-Or clone the repository and build locally:
+## Is this for you?
 
-```bash
-git clone https://github.com/GuhaneshT/WispTraceDB.git
-cd WispTraceDB
-go build ./...
+WispTraceDB fits when:
+
+- you run LLM agents in a **Go** service and want their traces stored locally, durably, with no
+  separate database or hosted service;
+- you care about **cost, tokens, latency and errors** per model, team or agent;
+- one machine's disk is enough for your trace volume.
+
+It is not a fit when you need several machines writing to one store, a built-in dashboard or
+network API, or full SQL. WispTraceDB is a library: it has no server of its own.
+
+## Install
+
+```
+go get github.com/GuhaneshT/WispTraceDB
 ```
 
----
+Requires Go 1.23 or newer. No cgo.
 
-> **v1 in progress.** The engine packages moved under `internal/` (not importable from other modules) as step 1 of [docs/V1-API-DESIGN.md](docs/V1-API-DESIGN.md). The public `wisptrace` package lands in step 2; until then the examples below, which use `cmd.*`, are stale and will be replaced.
-
-## Quick Start
-
-### Embedding WispTraceDB in Your Go Application
+## Quick start
 
 ```go
 package main
 
 import (
-    "fmt"
-    "log"
-    "time"
+	"context"
+	"fmt"
+	"log"
+	"time"
 
-    "github.com/GuhaneshT/WispTraceDB/cmd"
-    "github.com/GuhaneshT/WispTraceDB/rollup"
-    "github.com/GuhaneshT/WispTraceDB/wal"
+	wisptrace "github.com/GuhaneshT/WispTraceDB"
 )
 
 func main() {
-    // Open or create a database. CreateWisp() uses the default config,
-    // which writes relative paths (wal.log, segments/, wisp_lsm/, ...) in
-    // the current directory. To choose a location, start from the default
-    // config and override paths:
-    cfg := cmd.DefaultWispTraceConfig()
-    cfg.SegmentDir = "./traces_db/segments"
-    cfg.WALPath = "./traces_db/wal.log"
-    cfg.PebblePath = "./traces_db/wisp_lsm"
-    cfg.CheckpointPath = "./traces_db/checkpoint.dat"
-    cfg.ManifestPath = "./traces_db/manifest.dat"
+	ctx := context.Background()
 
-    db, err := cmd.CreateWispTraceWithConfig(cfg)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer db.Close()
+	db, err := wisptrace.Open("./traces")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
 
-    // Insert a span. Timestamp is Unix nanoseconds; Cost is a float64 dollar
-    // amount; TokensIn/TokensOut are int32.
-    span := wal.SpanPayload{
-        TraceID:      "trace-123",
-        SpanID:       "span-456",
-        ParentSpanID: "", // Empty for root span
-        Timestamp:    time.Now().UnixNano(),
-        AgentID:      "agent-1",
-        Model:        "gpt-4",
-        ToolName:     "search",
-        Team:         "platform",
-        Status:       "success",
-        TokensIn:     100,
-        TokensOut:    50,
-        Cost:         0.0015, // in dollars
-        LatencyMs:    245,
-        Payload:      []byte(`{"result": "found"}`),
-        Deleted:      false,
-    }
+	// Record an operation. End stores it durably.
+	ctx, span := db.StartSpan(ctx, "answer-question")
+	span.SetAgent("support-bot")
+	span.SetModel("gpt-4")
+	span.SetTeam("platform")
+	span.SetTokens(812, 164)
+	span.SetCost(0.0213)
+	if err := span.End(ctx); err != nil {
+		log.Fatal(err)
+	}
 
-    if err := db.InsertSpan(span); err != nil {
-        log.Fatal(err)
-    }
+	// Writes are durable immediately and visible to reads a moment later.
+	// Sync waits for that moment.
+	if err := db.Sync(ctx); err != nil {
+		log.Fatal(err)
+	}
 
-    // Spans are buffered and flushed in the background; Flush forces it.
-    if err := db.Flush(); err != nil {
-        log.Fatal(err)
-    }
+	trace, err := db.Trace(ctx, span.TraceID())
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("trace %s has %d span(s)\n", span.TraceID(), len(trace))
 
-    // Retrieve a single span.
-    retrieved, found, err := db.GetSpan("trace-123", "span-456")
-    if err != nil {
-        log.Fatal(err)
-    }
-    if found {
-        fmt.Printf("Span: %+v\n", retrieved)
-    }
-
-    // Retrieve a full trace.
-    trace, found, err := db.GetTrace("trace-123")
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("Trace has %d spans (found=%v)\n", len(trace), found)
-
-    // Query a time range.
-    start := time.Now().Add(-1 * time.Hour).UnixNano()
-    end := time.Now().UnixNano()
-    spans, err := db.RangeQuery(cmd.RangeFilter{StartTS: start, EndTS: end})
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("Found %d spans in the last hour\n", len(spans))
-
-    // Read rollup buckets (grouped by model) for a window.
-    aggs, err := db.QueryAggregations(rollup.WindowHour, start, end)
-    if err != nil {
-        log.Fatal(err)
-    }
-    for key, agg := range aggs {
-        fmt.Printf("Model %s: cost=$%.4f, tokens=%d\n",
-            key.Model,
-            rollup.UnscaleCost(agg.SumCost),
-            agg.SumTokensIn+agg.SumTokensOut)
-    }
+	costs, err := db.Costs(ctx, wisptrace.ByModel, wisptrace.Last(24*time.Hour))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("cost by model, last 24h:", costs)
 }
 ```
 
----
+## Recording spans
 
-## Core Concepts
+There are three ways in. All of them validate the span and return only after it is safely on disk.
 
-### Spans
-A span represents a unit of work in a trace. It includes:
-- **Hierarchy**: `TraceID`, `SpanID`, `ParentSpanID` (empty string = root, per OpenTelemetry convention)
-- **Execution**: `Timestamp` (Unix nanoseconds), `Status`, `LatencyMs`
-- **Resources**: `AgentID`, `Model`, `ToolName`, `Team`
-- **Costs**: `TokensIn`, `TokensOut` (`int32`), `Cost` (`float64`, dollars)
-- **Payload**: Opaque blob for application-specific data
-- **Deleted**: Tombstone flag (see "Deletion semantics" below)
+### 1. Start and end a span (most code should use this)
 
-### Traces
-A trace is a collection of related spans. Traces are hierarchical — each span can have a parent span, forming a tree or DAG. Root spans have an empty `ParentSpanID`.
+```go
+ctx, agentRun := db.StartSpan(ctx, "agent-run")
+defer agentRun.End(context.WithoutCancel(ctx))
 
-### Write-Ahead Log (WAL)
-All writes go to the WAL first. The WAL is segmented and fsynced after each append, ensuring durability before acknowledgment. The WAL is also the single source of truth — all other data structures (segments, index, rollups) are derived from it and can be rebuilt if necessary.
-
-### Segments
-Buffered spans are periodically flushed into immutable **row-oriented** segments on disk. Each segment includes:
-- A 38-byte header with metadata (magic, version, segment ID, span count, min/max timestamp zone map, bloom-section length)
-- A bloom section with filters for bounded-cardinality dimensions (agent_id, model, tool_name, team, status) for fast pruning
-- Length+CRC framed span records (the same payload encoding the WAL uses)
-
-Segments are **not** columnar and **not** compressed in v0. Columnar per-column encoding is a documented target, deferred until query semantics are stable.
-
-### Index
-A Pebble LSM index maps `(trace_id, span_id)` to its location `(segment_id, offset)`. Supports fast point lookups and range scans. The index is the authority on span liveness.
-
-### Compaction
-Periodically, small segments are merged into larger ones, and old data is pruned based on retention policies. Compaction never mutates segments in place; it creates new segments and swaps the manifest atomically. Every scanned record is re-verified against the index (a "staleness check") before it is acted on, so tombstone reclamation and partial merges are always safe.
-
-### Rollups
-Continuous aggregation windows (1 minute, 5 minutes, 1 hour, 1 day) continuously roll up `cost`, `tokens_in`, `tokens_out`, and `latency_ms` grouped by model. Cost is stored as fixed-point micro-dollars to avoid float drift. Rollups are snapshotted at checkpoint cadence and rebuilt from the WAL after a crash.
-
-### Deletion semantics
-Deletes go through `DeleteSpan(traceID, spanID)` and `DeleteTrace(traceID)`. Each writes a tombstone (`SpanPayload{Deleted: true}`) — a WAL record whose only durable effect is removing the span's key from the Pebble index at flush time; no tombstone record is ever written to a segment. All three read paths (`GetSpan`, `GetTrace`, `RangeQuery`) report a deleted span as absent. A span counted in a rollup and deleted *later* still keeps its contribution until its window expires (see "Known limitations").
-
----
-
-## API Overview
-
-### Lifecycle
-- `cmd.CreateWisp() (*WispTrace, error)` — open with the default config
-- `cmd.DefaultWispTraceConfig() WispTraceConfig` — defaults to start from
-- `cmd.CreateWispTraceWithConfig(cfg WispTraceConfig) (*WispTrace, error)` — open with an explicit config
-- `(*WispTrace).Close() error` — flush rollups/segments and close
-- `(*WispTrace).CloseWithoutFlush() error` — simulate a crash (tests)
-
-### Writes
-- `InsertSpan(span wal.SpanPayload) error` — append + fsync (durable on return); buffered for segmentation
-- `DeleteSpan(traceID, spanID string) error` — durably delete one span (idempotent; absent is a no-op)
-- `DeleteTrace(traceID string) error` — durably delete every live span of a trace (absent is a no-op)
-- `Flush() error` — drain the ingest channel and flush all buffered spans to a segment
-
-### Point Queries
-- `GetSpan(traceID, spanID string) (wal.SpanPayload, bool, error)` — one span; `found=false` if deleted/absent
-- `GetTrace(traceID string) ([]wal.SpanPayload, bool, error)` — all live spans of a trace
-
-### Range Queries
-- `RangeQuery(filter RangeFilter) ([]wal.SpanPayload, error)` — spans in a time range, optionally filtered by `AgentID`/`Model`/`ToolName`/`Team`/`Status`
-- `QueryByModel` / `QueryByTeam` / `QueryByStatus` / `QueryByAgentID` / `QueryByToolName` — convenience wrappers
-- `ListTraces(filter RangeFilter, limit int) ([]string, error)`
-- `QueryWithCursor(filter RangeFilter, pageSize int, cursor string) ([]wal.SpanPayload, string, error)`
-
-### Aggregations
-- `QueryAggregations(window string, startTS, endTS int64) (map[rollup.BucketKey]*rollup.Value, error)` — raw rollup buckets (`"1m"`, `"5m"`, `"1h"`, `"1d"`)
-- `GetCostByModel` / `GetCostByTeam`, `GetTokensByModel`, `GetTopTeamsByCost`, `GetTopModelsBySpanCount`, `GetFailedSpans`, `GetErrorRate` — derived over `RangeQuery`
-- `GetDistinctModels` / `GetDistinctTeams` / `GetDistinctAgents` — cardinality helpers
-
-### Maintenance
-- `CheckConsistency() *ConsistencyReport` — validate index↔segment↔manifest consistency (`report.OK()`, `report.Errors`, `report.Warnings`)
-- `LiveSegments() ([]uint64, error)` — the current manifest contents
-
-Compaction and retention expiry run automatically on background tickers; there is no public `Compact`/`Expire` method.
-
----
-
-## Current Status
-
-### ✅ What Works
-- **Phase 1 (WAL & Crash Recovery)** — Complete. Spans are durable immediately; the WAL survives any crash.
-- **Phase 2 (Segment Write & Reconciliation)** — Complete. Segments and index stay in sync; flushed spans are immediately queryable.
-- **Phase 3 (Compaction)** — Complete. Segments are merged, old data is pruned, and the index is maintained correctly via the staleness check.
-- **Phase 4 (Bloom Filters & Zone Maps)** — Complete. Range queries use bloom filters and timestamp ranges to prune candidates.
-- **Phase 5 (Rollups & Aggregation)** — **Partial.** 1m/5m/1h/1d windows group by model; snapshots persist at checkpoint cadence. Root-attributed rollups and the columnar-scan fallback for unaligned windows are designed but not built.
-- **Phase 6 (Query API)** — **Partial.** The Go package API is complete; there is no HTTP server, OTLP ingestion, or `main` package yet.
-
-### ⚠️ Known Limitations
-- **No HTTP server / OTLP ingestion / `main` package** — this is a library + engine, not a runnable product.
-- **Rollup dimensions are model-only** — root-attributed rollups are designed but not implemented.
-- **Unaligned aggregation windows return nothing** — `QueryAggregations` on a window that is not bucket-aligned silently drops boundary buckets; the columnar-scan fallback is not built.
-- **Columnar segments not implemented** — segments are row-oriented; per-column encoding was deferred.
-- **`QueryWithCursor` is not a stable snapshot** — it re-runs the full `RangeQuery` per page and uses a numeric-offset cursor; concurrent flush/compaction can skip or duplicate spans across pages.
-- **`CheckConsistency` cannot automatically detect a lost index write** — deleted-after-write spans are structurally indistinguishable from a lost index entry, so that check is a warning, not an error.
-- **A span counted in a rollup then deleted later keeps its contribution** until the window expires.
-
-### 📈 Performance
-
-Benchmarks are recorded in `docs/benchmarks/` and `benchmark.txt`; root-cause analysis is in `pers.txt` §5. The numbers are laptop-and-Windows-bound (i7-1250U, 12 threads); **the ratios are the findings, not the absolute numbers.**
-
-- **Point lookup**: ~140 µs (well below the 50 ms target). The light read path plus the segment reader cache cut `GetSpan` from 14,547 B / 35 allocs to **386 B / 14 allocs** per lookup; `GetTrace` (5,711 B / 128) and the recovery dedupe check (365 B / 13) came down with it.
-- **Parallel insert does not scale** — median **~0.74x** sequential, fsync-per-append under a mutex. WAL group commit is the planned fix.
-- **`RangeQuery` on merged segments costs ~1.2 MB and ~60k allocs per query** for a window returning ~101 spans (down from ~3.0 MB / 70k). The cost is per *scanned* record, not per returned span. The per-candidate staleness index lookup now runs after the cheap filter and the scan streams via `ScanAllFunc`; replacing the N point lookups with one index snapshot iterator is not done.
-- **`RangeQuery` (uncompacted) did not finish inside the benchmark suite's default 10m timeout** — run it separately with `-timeout`.
-- See [docs/benchmarks/post-cache-20261015.txt](docs/benchmarks/post-cache-20261015.txt) and [post-1-unconfirmed-is-not-corrupt.md](docs/blog/post-1-unconfirmed-is-not-corrupt.md) for details and caveats.
-
----
-
-## Design Philosophy
-
-WispTraceDB follows three immutable design pillars:
-
-1. **Durable Ingestion (WAL)** — Accept a span, validate it, fsync it, acknowledge it. Every acknowledged span survives any crash.
-2. **Immutable Storage & Compaction (Segments)** — Buffer spans into immutable segments; periodically merge and prune. Never mutate data in place.
-3. **Indexing & Aggregation (LSM + Rollups)** — Answer queries fast via LSM tree and continuous rollups. Bloom filters and zone maps prune candidates.
-
-All derived state (segments, index, rollups) is rebuildable from the WAL. If every segment, index file, and rollup were deleted, the WAL alone would reconstruct correct state.
-
----
-
-## Architecture & Documentation
-
-**For deep dives**, see:
-- [PAD1.md](docs/PAD1.md) — **Frozen v1.3.2 Architecture** (target design, with an amendment log; not a description of shipped behavior)
-- [PDD1.md](docs/PDD1.md) — **Frozen v1.3 Design Doc** (objectives, competitive analysis, USP)
-- [CLAUDE.md](CLAUDE.md) — as-built status and the authoritative source when it disagrees with PAD1
-- [docs/TECHNICAL-GUIDE.md](docs/TECHNICAL-GUIDE.md) — code-accurate walkthrough: deletion semantics, consistency model, recovery details
-- [docs/OPTIMIZATION-CHECKLIST.md](docs/OPTIMIZATION-CHECKLIST.md) — performance work tracker
-- [docs/checklist.txt](docs/checklist.txt) — v0→v1 build checklist
-
----
-
-## Building & Testing
-
-### Prerequisites
-- Go 1.23 or later
-
-### Commands
-
-```bash
-# Build all packages
-go build ./...
-
-# Run all tests
-go test ./... -v
-
-# Run a specific test
-go test ./internal/wal -run TestWALTombstoneRoundTripsAsAuthoritativeDelete -v
-
-# Run the fault-injection harness (kill -9 durability test)
-go test ./tests -run FaultInjection -v
-
-# Run the benchmarks (see docs/benchmarks/ for the last recorded runs).
-# Use -timeout: the full suite exceeds go test's default 10m because every
-# preload insert fsyncs. Run RangeQuery on its own if needed.
-go test ./internal/engine -run '^$' -bench . -benchmem -timeout 30m
-
-# Check for issues
-go vet ./...
-
-# Format code
-go fmt ./...
+ctx, call := db.StartSpan(ctx, "llm-call") // child of agent-run, same trace
+call.SetModel("gpt-4")
+call.SetTokens(120, 30)
+call.SetCost(0.002)
+call.SetAttribute("prompt_version", 7)
+if err != nil {
+	call.SetError(err) // marks the span failed and keeps the message
+}
+call.End(ctx)
 ```
 
-### Fault Injection Test
-WispTraceDB includes a fault-injection harness that force-kills the process during writes to verify durability:
+- A span started from a context that already holds one becomes its child and joins its trace.
+- To join a trace that started in another service, use `wisptrace.WithTraceID(id)` and
+  `wisptrace.WithParentSpanID(id)`.
+- `End` takes the duration from the clock and marks the span `ok` unless you set a status or an error.
+- Pass `End` a context that is still alive. If the operation was cancelled and you pass the same
+  context, the span will not be stored. `context.WithoutCancel(ctx)` avoids that.
+- `NewTraceID()` and `NewSpanID()` give OpenTelemetry-format IDs if you need to generate your own.
 
-```bash
-go test ./tests -run FaultInjection -v
+### 2. Hand over finished spans
+
+When you already have complete spans, for example from another system. Mind the start times:
+spans older than the retention window (7 days by default) are dropped soon after they are stored.
+
+```go
+err := db.Ingest(ctx, wisptrace.Span{
+	TraceID: "t1", SpanID: "s1",
+	Start:    time.Now(),
+	Duration: 245 * time.Millisecond,
+	Model:    "gpt-4", Team: "platform", Status: wisptrace.StatusOK,
+	TokensIn: 100, TokensOut: 50, CostUSD: 0.0015,
+})
+
+res, err := db.IngestBatch(ctx, spans) // invalid spans are reported, not fatal
+fmt.Println(res.Accepted, res.Rejected)
 ```
 
-This test spawns a worker process, force-kills it at various points during ingestion, then verifies that every acknowledged span survives.
+### 3. OpenTelemetry (OTLP/JSON)
 
----
+`IngestOTLP` accepts the body an OpenTelemetry exporter sends when configured for `http/json`:
 
-## Package Layout
-
-```
-internal/wal/              — Segmented write-ahead log, span encoding/decoding
-internal/pebble/           — LSM index (Pebble wrapper), span location storage
-internal/bloom/            — Fixed-size bloom filters for pruning
-internal/segment/          — Segment writer/reader, manifest, reader cache, immutable storage
-internal/compactor/        — Segment merge, retention expiry, staleness check
-internal/rollup/           — Continuous aggregation windows (1m/5m/1h/1d)
-internal/engine/ — WispTrace engine: ingestion, queries, checkpoint, consistency, API
-tests/            — Fault injection and WAL tests
-docs/             — Architecture, design, technical guides, benchmarks
+```go
+res, err := db.IngestOTLP(ctx, r) // r is an io.Reader over the request body
 ```
 
----
+The library has no HTTP server, so you decide how requests reach it. To accept exporters over
+HTTP, mount a handler in your own service:
 
-## Roadmap
+```go
+http.HandleFunc("/v1/traces", func(w http.ResponseWriter, r *http.Request) {
+	_, err := db.IngestOTLP(r.Context(), r.Body)
+	switch {
+	case errors.Is(err, wisptrace.ErrInvalidOTLP):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, wisptrace.ErrTooLarge):
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, "{}")
+	}
+})
+```
 
-### Planned (Not Yet Implemented)
-- **v0 release hardening** — stabilize `QueryWithCursor`; re-measure and record benchmarks.
-- **Group commit** — batch concurrent WAL appends into one fsync to fix the ~1x parallel insert scaling.
-- **RangeQuery scan cost** — one Pebble snapshot iterator instead of N point lookups; chunked/callback scan to cut per-span allocations.
-- **Compaction measurement** — benchmark the staleness check, currently unmeasured.
-- Root-attributed rollups — "total cost of workflows started by Agent X" (designed, not built)
-- Columnar-scan aggregation fallback for unaligned windows
-- Columnar segment encoding — higher compression and faster scans
-- HTTP server — REST API for remote queries
-- OTLP ingestion — native OpenTelemetry Protocol support
+Point your exporter at it with `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`. Protobuf and gRPC are not
+supported. Decompress gzip bodies yourself before calling `IngestOTLP`.
 
-### Not In Scope for v1
-- Replication or clustering
-- SQL or advanced query language
-- Schema evolution beyond the WAL version byte
-- Cross-process access (single-node only)
+How OTLP fields are stored:
 
----
+| OTLP | Stored as |
+|---|---|
+| `traceId`, `spanId`, `parentSpanId` | Trace ID, span ID, parent ID, exactly as sent |
+| `startTimeUnixNano`, `endTimeUnixNano` | Start time, and duration (end minus start) |
+| `status.code` | `ok`, `error` or `unset` |
+| `gen_ai.request.model` / `gen_ai.response.model` | Model |
+| `gen_ai.usage.input_tokens` / `output_tokens` | Input and output tokens |
+| `gen_ai.agent.id` or `gen_ai.agent.name` | Agent |
+| `gen_ai.tool.name` | Tool |
+| `wisp.team`, or resource `service.namespace` | Team |
+| `wisp.cost_usd` | Cost in US dollars |
+| span name, status message, all other attributes | The span's JSON payload |
 
-## License
+OpenTelemetry defines no cost or team attribute, so set `wisp.cost_usd` and `wisp.team` yourself
+if you want them.
 
-MIT. See the repository for licensing details.
+## Reading your data
 
----
+```go
+sp, err := db.Span(ctx, traceID, spanID)  // errors.Is(err, wisptrace.ErrNotFound)
+tr, err := db.Trace(ctx, traceID)         // every live span of a trace
+
+// Filter by time and dimensions, 100 per page by default (1000 at most).
+q := wisptrace.Query{
+	Range:  wisptrace.Last(time.Hour),
+	Model:  "gpt-4",
+	Status: wisptrace.StatusError,
+}
+for {
+	page, err := db.Query(ctx, q)
+	if err != nil { log.Fatal(err) }
+	for _, s := range page.Spans { fmt.Println(s.TraceID, s.SpanID) }
+	if page.NextCursor == "" { break }
+	q.Cursor = page.NextCursor
+}
+
+last := wisptrace.Last(24 * time.Hour)
+
+// Totals
+costs, err  := db.Costs(ctx, wisptrace.ByTeam, last)        // dollars per team (or ByModel)
+tokens, err := db.TokensByModel(ctx, last)                  // in / out / total per model
+rate, err   := db.ErrorRate(ctx, "gpt-4", last)             // 0.0 to 1.0; "" means all models
+
+// Rankings and discovery
+teams, err  := db.TopTeamsByCost(ctx, 5, last)              // most expensive first
+models, err := db.TopModelsBySpanCount(ctx, 5, last)        // most used first
+names, err  := db.Distinct(ctx, wisptrace.DimModel, last, 0) // DimTeam, DimAgent too
+
+// Finding things
+failed, err := db.FailedSpans(ctx, last, 50)                // spans whose status is a failure
+ids, err    := db.Traces(ctx, wisptrace.Query{Range: last, Team: "platform"}) // distinct trace IDs
+```
+
+A span counts as failed unless its status is `ok`, `unset` or `success`. OpenTelemetry leaves
+successful spans `unset`, so those are not errors.
+
+Results come back oldest first, or newest first with `Query.NewestFirst`; `Trace` returns a trace's
+spans in start-time order. Paging evaluates the whole range on every call, so keep the range bounded:
+the cost follows the number of spans in the range, not the page size.
+
+Time ranges: `wisptrace.Last(d)`, `wisptrace.Between(from, to)`, or a zero `TimeRange{}` for everything.
+
+### Fast per-model totals (precomputed buckets)
+
+`Costs`, `TokensByModel` and the other totals above read the matching spans, so they slow down as
+the window grows. `Aggregates` reads buckets that are updated as spans arrive, so it costs the same
+however much data you have. It also gives you latency, which the other totals do not:
+
+```go
+buckets, err := db.Aggregates(ctx, wisptrace.WindowHour,
+	wisptrace.Between(from.Truncate(time.Hour), to.Truncate(time.Hour)))
+for _, b := range buckets {
+	fmt.Printf("%s %-8s spans=%d cost=$%.4f in=%d out=%d latency avg=%v min=%v max=%v\n",
+		b.Start.Format(time.RFC3339), b.Model, b.Spans, b.CostUSD,
+		b.TokensIn, b.TokensOut, b.LatencyAvg, b.LatencyMin, b.LatencyMax)
+}
+```
+
+Windows are `WindowMinute`, `WindowFiveMinutes`, `WindowHour` and `WindowDay`. Buckets come back
+ordered by start time, then model. These are the rules, and they are deliberate:
+
+- **Grouped by model only.** There are no per-team, per-agent or per-tool buckets. Spans recorded
+  without a model are grouped under the empty model name `""`. For other dimensions use `Costs`,
+  `Query` and the other queries, which read the spans themselves.
+- **Whole windows, aligned to the Unix epoch in UTC.** A bucket is returned if its start time is
+  inside `[From, To)`. A bucket that begins before `From` is left out even though part of it falls
+  inside your range, and one that begins inside the range is returned whole. Truncate your range to
+  the window size, as above, to get complete buckets. `wisptrace.Last(24 * time.Hour)` with
+  `WindowHour` therefore drops the oldest partial hour and includes the current one.
+- **Counted when ingested.** Deleting a span does not remove it from a bucket, and sending the same
+  span ID twice counts it twice. The span-reading queries do not have either issue.
+- **Cost is kept to a millionth of a dollar per span.** Costs smaller than that round to zero.
+- **Latency is in whole milliseconds,** as an average, a minimum and a maximum per bucket.
+- **Old buckets are dropped** along with the retention window.
+- **Like every read,** a span shows up in buckets once it is visible (see `Sync`).
+
+### Deleting
+
+```go
+db.DeleteSpan(ctx, traceID, spanID) // no-op if absent
+db.DeleteTrace(ctx, traceID)
+```
+
+Deleted spans disappear from every read.
+
+## What you can rely on
+
+**Acknowledged spans survive crashes.** When `Ingest`, `End`, `IngestBatch` or `IngestOTLP` returns
+without an error, the span is on disk and will still be there after a power loss, an OOM kill or a
+panic. The project's test suite kills a loaded process repeatedly and checks that every acknowledged
+span comes back unchanged.
+
+**Visible shortly, not instantly.** A span is durable the moment the call returns, but reads and
+aggregates may not see it for a short while afterwards. If you read right after writing, either call
+`db.Sync(ctx)` or open the database with `wisptrace.WithReadYourWrites()`.
+
+**Retention defaults to 7 days, judged by the span's start time.** Spans whose start time is older
+than the window are removed by a background pass that runs about every 10 minutes, whenever they were
+written. That matters if you backfill: spans stamped more than 7 days ago are stored, readable for a
+while, then dropped. Removal happens a storage segment at a time, so some older spans can outlive the
+cutoff. Change the window with `wisptrace.WithRetention(d)`, and set it above the age of anything you
+plan to load.
+
+**Invalid spans are rejected, not stored.** A span needs a non-empty trace ID and span ID. Its start
+time must be a real timestamp between the years 2000 and 2100, which catches milliseconds sent where
+nanoseconds are expected. Durations, token counts and cost must not be negative, and cost must be a
+finite number. ID, model, agent, tool, team and status strings may be at most 256 bytes. A payload
+must be valid JSON of at most 64 KiB. The error is a `*ValidationError` naming the field and matches
+`wisptrace.ErrInvalidSpan`.
+
+**Sending the same span ID twice replaces the first.** The last write for a `(trace ID, span ID)`
+pair wins.
+
+**One process per directory.** A database directory can be open in one process at a time. Close it
+before opening it elsewhere.
+
+## Options
+
+```go
+db, err := wisptrace.Open("./traces",
+	wisptrace.WithRetention(30*24*time.Hour), // default 7 days
+	wisptrace.WithFlushThreshold(5000),       // buffered spans before writing a segment; default 1000
+	wisptrace.WithSegmentCacheSize(128),      // open segment files kept for lookups; default 64
+	wisptrace.WithReadYourWrites(),           // every write waits until it is visible
+)
+```
+
+## Errors
+
+All are checked with `errors.Is`:
+
+| Error | Meaning |
+|---|---|
+| `ErrNotFound` | The span or trace does not exist, or was deleted |
+| `ErrInvalidSpan` | A span failed validation (details in `*ValidationError`) |
+| `ErrInvalidOTLP` | The OTLP request was not valid OTLP/JSON; nothing was stored |
+| `ErrTooLarge` | The OTLP request exceeded `MaxOTLPBytes` (16 MiB) |
+| `ErrEnded` | `End` was called twice on one span |
+| `ErrClosed` | The database was already closed |
+
+Every method takes a `context.Context`. Cancellation is honoured between operations and between
+spans in a batch, but a disk sync that has already started cannot be interrupted.
+
+## Checking the database
+
+```go
+report, err := db.Check(ctx)
+if err == nil && !report.OK() {
+	log.Println("integrity problems:", report.Errors)
+}
+```
+
+`Check` reads everything, so run it when the service is quiet. Close the database with `db.Close()`
+so buffered spans are flushed; after an unclean exit, the next `Open` recovers automatically.
+`db.Flush(ctx)` writes buffered spans to disk immediately, which is useful before copying the data
+directory. It is not needed for durability.
+
+## Know the limits
+
+- **Write speed is bounded by your disk.** Each span waits for a disk sync before it is acknowledged,
+  so throughput depends on how fast your storage syncs. Sending a batch does not yet combine those
+  syncs, and parallel writers do not speed things up. Faster ingestion is planned.
+- **Most aggregates scan the time window you ask for.** `Costs`, `TokensByModel`, `ErrorRate`, the
+  `Top*` rankings and `Distinct` read the matching spans, so they get slower as the window grows. They are comfortable for the volumes this
+  library targets, not for scanning months of heavy traffic on every request.
+- **Paging is positional.** Cursors are positions in a fixed order. New spans arriving after your
+  position do not disturb them, but a span inserted, deleted or expired earlier in the order shifts
+  later pages by one, so you may see a span twice or miss one. Use a bounded time range and fetch
+  the pages promptly.
+- **`Aggregates` can over-count.** Its buckets are model-only by design, a deleted span keeps its
+  contribution until the bucket expires, and a span ingested twice is counted twice. The queries that
+  read spans directly are unaffected.
+- **Duration has millisecond precision.** Sub-millisecond durations are truncated.
+- **Single machine only.** There is no replication or clustering.
+- **Not a server.** The project ships no HTTP server, and OTLP/protobuf and gRPC are not supported.
+
+## How it works, briefly
+
+Spans are appended to a write-ahead log and synced before they are acknowledged. Background workers
+batch them into immutable segment files and keep an index so any span or trace is found directly.
+Old segments are merged and expired by retention. Everything except the log can be rebuilt from it,
+which is why a crash never loses an acknowledged span.
+
+The detailed design, the on-disk format, benchmark results and the list of known issues are in
+[docs/](docs/):
+
+- [TECHNICAL-GUIDE.md](docs/TECHNICAL-GUIDE.md): how the engine works, as built
+- [PAD1.md](docs/PAD1.md) and [PDD1.md](docs/PDD1.md): architecture and design
+- [DEVELOPMENT.md](docs/DEVELOPMENT.md): building, testing, benchmarks, project status and roadmap
+- [V1-API-DESIGN.md](docs/V1-API-DESIGN.md): the public API design
 
 ## Contributing
 
-Contributions are welcome. Please ensure:
-- All tests pass: `go test ./... -v`
-- Code follows Go conventions: `go fmt ./...`
-- No new external dependencies without discussion
-- New features include tests and documentation
+Contributions are welcome. Please run `go vet ./...` and `go test ./...` before sending changes,
+add tests for new behaviour, and discuss any new dependency first. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
+explains how to build and test, including the crash-recovery suite.
 
----
+## License
 
-## Questions & Issues
-
-For questions or issues, see:
-- [CLAUDE.md](CLAUDE.md) for implementation details and known issues
-- [docs/](docs/) for architecture and design documents
-- GitHub issues for bug reports and feature requests
-
----
-
-## Summary
-
-WispTraceDB is a purpose-built, durable, embeddable trace store for LLM agents. It's designed for teams who want crash-safe trace storage without running a separate database process. Ship it as a library inside your Go application, write spans to it, and query them fast — all with guaranteed durability and no external dependencies.
+MIT.

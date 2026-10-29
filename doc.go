@@ -12,6 +12,25 @@
 //		TokensIn: 100, TokensOut: 50, CostUSD: 0.0015,
 //	})
 //
+// # Recording spans by hand
+//
+// StartSpan returns a span you fill in as an operation proceeds; End stores it.
+// Spans started from a context that already carries one become its children.
+//
+//	ctx, span := db.StartSpan(ctx, "summarize")
+//	defer span.End(ctx)
+//	span.SetModel("gpt-4")
+//	span.SetTokens(120, 30)
+//	span.SetCost(0.002)
+//
+// Use Ingest or IngestBatch instead when you already have complete Span values.
+//
+// # OpenTelemetry
+//
+// IngestOTLP ingests an OTLP/JSON ExportTraceServiceRequest, the body an
+// OpenTelemetry exporter set to http/json sends. The package has no server of
+// its own: embed it behind whatever transport your application already has.
+//
 // # Guarantees
 //
 // Ingest returns only after the span's WAL record has been fsynced: an

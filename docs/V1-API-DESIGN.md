@@ -7,15 +7,14 @@ durability architecture. Anything that does must go through a PAD1 amendment.
 ## 1. Goals
 
 1. A Go library an application can embed with one import and one `Open` call.
-2. A small runnable server (`wisptraced`) that accepts spans over HTTP.
-3. One validation path, one type set and one error vocabulary shared by both.
+2. OTLP/JSON ingestion built into the library, so any host application can accept
+   OpenTelemetry spans through its own transport.
+3. One validation path, one type set and one error vocabulary.
 
 ## 2. Layout
 
 ```
 wisptrace/        public facade: Span, Query, errors, Open  (the semver contract)
-server/           HTTP: /v1/spans, /v1/traces (OTLP/JSON), /healthz — calls only wisptrace
-cmd/wisptraced/   binary: flags/env -> Open -> server -> graceful Close
 internal/         wal, segment, pebble, bloom, compactor, rollup, engine (not importable)
 ```
 
@@ -35,8 +34,9 @@ page, err := db.Query(ctx, wisptrace.Query{Range: wisptrace.Last(time.Hour), Mod
 costs, err := db.Costs(ctx, wisptrace.ByModel, wisptrace.Last(24*time.Hour))
 ```
 
-- **Write:** `Ingest`, `IngestBatch` (per-span accepted/rejected), `DeleteSpan`, `DeleteTrace`.
-- **Read:** `Span`, `Trace`, `Query` (filter + cursor page), `Costs`, `Tokens`, `Top`, `Distinct`, `ErrorRate`.
+- **Write:** `Ingest`, `IngestBatch` (per-span accepted/rejected), `IngestOTLP`, `DeleteSpan`, `DeleteTrace`.
+- **Manual spans:** `StartSpan` -> `*ActiveSpan` (setters, `End`), context-propagated parenting, `NewTraceID`/`NewSpanID`. Built on `Ingest`; no new storage path.
+- **Read:** `Span`, `Trace`, `Query` (filter + cursor page), `Traces`, `FailedSpans`, `Costs`, `TokensByModel`, `ErrorRate`, `TopTeamsByCost`, `TopModelsBySpanCount`, `Distinct`; and `Aggregates`, the rollup-backed per-model buckets (1m/5m/1h/1d with count, cost, tokens, latency avg/min/max). Rollups are model-only by design; see the README for bucket-alignment rules.
 - **Operate:** `Sync(ctx)`, `Stats()`, `Check(ctx)`, `Close()`.
 - **Types:** the package's own `Span` (`time.Time`, `time.Duration`, `json.RawMessage`),
   converted to the engine's `wal.SpanPayload` at the boundary so internals can change freely.
@@ -74,28 +74,31 @@ ingest, so a client retry double-counts cost and tokens. Plan: skip the rollup u
 key is already indexed/buffered, *if* the insert benchmark shows an acceptable cost; otherwise
 document at-least-once counting prominently. Either way the README states which.
 
-## 4. HTTP ingestion (package `server`, built on `wisptrace`)
+## 4. OTLP/JSON ingestion (library only; decided 2026-10-29)
 
-| Route | Body |
-|---|---|
-| `POST /v1/spans` | `{"spans":[{trace_id, span_id, parent_span_id, timestamp_ns, agent_id, model, tool_name, team, status, tokens_in, tokens_out, cost_usd, latency_ms, payload}]}` |
-| `POST /v1/traces` | OTLP/JSON `ExportTraceServiceRequest` |
-| `GET /healthz` | liveness |
+The earlier plan for an HTTP server and a `wisptraced` binary was dropped: v1 ships as an
+embeddable library only. OTLP support lives in the library as
 
-- **OTLP mapping** (PAD1 §4a, concretely): hex IDs; `start_time_unix_nano` accepted as JSON
-  string or number; `latency_ms = (end-start)/1e6`; `status.code` -> `ok|error|unset`;
-  GenAI semantic-convention attributes (`gen_ai.request.model`, `gen_ai.usage.input_tokens`,
-  `gen_ai.usage.output_tokens`, `gen_ai.agent.id`, `gen_ai.tool.name`); `wisp.cost_usd` and
-  `wisp.team` for what the conventions lack (team falls back to resource `service.namespace`);
-  unmapped attributes serialised into `Payload`.
-- **Ack:** `200` only after every accepted span is fsynced. Body mirrors OTLP partial success:
-  `{accepted, rejected, errors:[{index, reason}]}`. Invalid spans are per-span errors.
-- **Limits:** 4 MB body, 1,000 spans/batch, in-flight concurrency cap. `503` + `Retry-After`
-  under backpressure; `413`, `401`, `415` as expected; `500` means the WAL append failed
-  (never acknowledged).
-- **Auth/network:** binds `127.0.0.1` by default; optional bearer token; TLS via reverse proxy.
-- **Shutdown:** stop accepting, drain in-flight, then `Close()` (final flush).
-- **Out of scope for v1:** OTLP protobuf and gRPC, TLS, query/metrics endpoints.
+```go
+func (db *DB) IngestOTLP(ctx context.Context, r io.Reader) (BatchResult, error)
+```
+
+- **Input:** an OTLP/JSON `ExportTraceServiceRequest`. int64 fields may be JSON strings or
+  numbers; unknown fields are ignored; the request is capped at `MaxOTLPBytes` (16 MiB).
+- **Mapping** (documented on the method): hex ids as sent; `startTimeUnixNano` -> `Start`;
+  `end - start` -> `Duration`; `status.code` -> `ok|error|unset`; GenAI semantic-convention
+  attributes (`gen_ai.request/response.model`, `gen_ai.usage.input/output_tokens`,
+  `gen_ai.agent.id/.name`, `gen_ai.tool.name`); `wisp.cost_usd` and `wisp.team` for what the
+  conventions lack, with team falling back to resource `service.namespace`; span name, status
+  message and unmapped attributes go to `Payload` as JSON.
+- **Results:** same guarantees as `Ingest` (durable on return). Per-span rejections carry the
+  index in request order across all resource/scope spans, and match `ErrInvalidSpan`. A body
+  that is not valid OTLP/JSON returns `ErrInvalidOTLP` and stores nothing; an oversize body
+  returns `ErrTooLarge`.
+- **Embedding:** the application owns the transport. To accept OpenTelemetry exporters it
+  mounts its own handler that calls `IngestOTLP` (a ~20 line `http.Handler`; an optional
+  helper in the library is a possible follow-up, not a v1 requirement).
+- **Out of scope for v1:** OTLP/protobuf and gRPC, any server, TLS, auth.
 
 Throughput is fsync-bound (one fsync per span); the README states this plainly. WAL group
 commit is the planned fix and does not change any API here.
@@ -105,12 +108,10 @@ commit is the planned fix and does not change any API here.
 1. Move engine packages under `internal/`; all existing tests incl. fault injection stay green.
 2. `wisptrace` facade: types, errors, validation, `Open`/`Close`, `Ingest`, `Span`, `Trace`,
    then queries, aggregations, delete, operate.
-3. `server/` and `cmd/wisptraced`.
+3. `IngestOTLP` in the library (done).
 4. Docs, LICENSE, CI (vet + test + fault injection on Linux and Windows), godoc examples,
    CHANGELOG, release candidate.
 
 ## 6. Test plan
 
-OTLP mapping unit tests; one validation test per rule; `httptest` end-to-end
-(POST -> `Sync` -> `Span`/`Trace`/aggregations); kill-after-200 crash test in the
-fault-injection style; limit/backpressure tests; facade `Example` tests.
+OTLP mapping unit tests; one validation test per rule; `IngestOTLP` tests (mapping, rejections, malformed, oversize); facade `Example` tests.

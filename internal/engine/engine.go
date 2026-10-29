@@ -1648,7 +1648,7 @@ func (w *WispTrace) GetFailedSpans(limit int, startTS, endTS int64) ([]wal.SpanP
 	var failed []wal.SpanPayload
 	for _, s := range spans {
 		st := strings.ToLower(s.Status)
-		if st != "ok" && st != "success" && st != "" {
+		if st != "ok" && st != "success" && st != "unset" && st != "" {
 			failed = append(failed, s)
 			if limit > 0 && len(failed) >= limit {
 				break
@@ -1670,7 +1670,7 @@ func (w *WispTrace) GetErrorRate(model string, startTS, endTS int64) (float64, e
 	var errorCount int
 	for _, s := range spans {
 		st := strings.ToLower(s.Status)
-		if st != "ok" && st != "success" && st != "" {
+		if st != "ok" && st != "success" && st != "unset" && st != "" {
 			errorCount++
 		}
 	}
