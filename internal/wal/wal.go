@@ -99,7 +99,7 @@ func getString(data []byte) (string, int, error) {
 	return s, end, nil
 }
 
-//encode the wal record payload
+// encode the wal record payload
 func encodePayload(dst []byte, record WALRecord) {
 	span := record.Span
 	binary.LittleEndian.PutUint64(dst[0:8], uint64(span.Timestamp))
